@@ -429,7 +429,9 @@ impl<'a> Disassembler<'a> {
         let mut missed_targets: Vec<usize> = Vec::new();
         let mut missed_actions: Vec<usize> = Vec::new();
 
-        let all_starts: Vec<usize> = self.symbols.keys().copied().collect();
+        // Sorted so action ids follow offset order on every run.
+        let mut all_starts: Vec<usize> = self.symbols.keys().copied().collect();
+        all_starts.sort_unstable();
         for start in all_starts {
             if let Some(info) = self.symbols.get(&start)
                 && matches!(info.kind, LabelKind::Action { .. })
@@ -619,7 +621,10 @@ impl<'a> Disassembler<'a> {
     }
 
     fn insert_missing_action_symbols(&mut self) {
-        for &offset in &self.action_offsets.clone() {
+        // Sorted so action ids follow offset order on every run.
+        let mut pending: Vec<usize> = self.action_offsets.iter().copied().collect();
+        pending.sort_unstable();
+        for offset in pending {
             if self.symbols.contains_key(&offset) {
                 continue;
             }
