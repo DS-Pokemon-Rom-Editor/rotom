@@ -194,7 +194,8 @@ fn handle_compile_command(
     };
 
     if let Err(error) = result {
-        if !json {
+        // --json already reports per-file failures on stdout; other errors go to stderr to keep it JSON.
+        if !json || !matches!(error, ProjectError::CompileFailures { .. }) {
             eprintln!("Compilation failed: {}", error);
         }
         std::process::exit(1);
