@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::{BatchCompileResult, BatchDecompileResult};
 use snafu::ResultExt;
 
-use super::compile::{compile_project, decompile_project};
+use super::compile::{compile_project, decompile_project_files};
 use super::config::{find_project_root, load_config};
 use super::convert::{ConvertOptions, ConvertReport, convert_project};
 use super::error::{CurrentDirectorySnafu, IoSnafu, ProjectError, Result};
@@ -16,10 +16,10 @@ pub fn compile_mode(force: bool) -> Result<BatchCompileResult> {
     compile_project(&root, &config, force)
 }
 
-pub fn decompile_mode() -> Result<BatchDecompileResult> {
+pub fn decompile_mode(files: &[PathBuf]) -> Result<BatchDecompileResult> {
     let root = resolve_project_root(None)?;
     let config = load_config(&root)?;
-    decompile_project(&root, &config)
+    decompile_project_files(&root, &config, files)
 }
 
 pub fn init_mode(root: Option<&Path>, non_interactive: bool) -> Result<InitReport> {

@@ -392,12 +392,37 @@ fn dependency_hashes_for_script(
 /// generated sources in compile state so a follow-up project compile can skip
 /// unchanged outputs.
 pub fn decompile_project(root: &Path, config: &RotomConfig) -> Result<BatchDecompileResult> {
+    decompile_project_files(root, config, &[])
+}
+
+/// Decompile only `files` with the full project context, or every binary when `files` is empty.
+/// Only a full run marks the compile state as current, so a partial run never hides a rebuild the
+/// other entries need.
+pub fn decompile_project_files(
+    root: &Path,
+    config: &RotomConfig,
+    files: &[PathBuf],
+) -> Result<BatchDecompileResult> {
     let project = std::sync::Arc::new(crate::ProjectContext::load_for_decompile(root, config)?);
     let db_hash = project.database_hash();
     let root = project.root();
     let config = project.config();
 
-    let work = collect_project_decompile_work(root, config)?;
+    let mut work = collect_project_decompile_work(root, config)?;
+    if !files.is_empty() {
+        let wanted = files
+            .iter()
+            .map(|file| {
+                let canonical = fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+                work.iter()
+                    .position(|(input, _)| {
+                        fs::canonicalize(input).unwrap_or_else(|_| input.clone()) == canonical
+                    })
+                    .ok_or_else(|| ProjectError::UnknownDecompileFile { path: file.clone() })
+            })
+            .collect::<Result<std::collections::BTreeSet<usize>>>()?;
+        work = wanted.into_iter().map(|i| work[i].clone()).collect();
+    }
 
     let total_files = work.len();
     let progress = indicatif::ProgressBar::new(total_files as u64);
@@ -434,7 +459,7 @@ pub fn decompile_project(root: &Path, config: &RotomConfig) -> Result<BatchDecom
 
     progress.finish_with_message("Done");
 
-    update_decompile_state(root, config, db_hash, &successes)?;
+    update_decompile_state(root, config, db_hash, &successes, files.is_empty())?;
 
     Ok(BatchDecompileResult {
         successes,
@@ -491,6 +516,7 @@ pub(crate) fn update_decompile_state(
     config: &RotomConfig,
     db_hash: u64,
     successes: &[crate::DecompileFileResult],
+    mark_metadata: bool,
 ) -> Result<()> {
     if successes.is_empty() {
         return Ok(());
@@ -521,7 +547,9 @@ pub(crate) fn update_decompile_state(
         state.entries.insert(relative_path, file_state);
     }
 
-    state.mark_metadata(db_hash, COMPILER_VERSION);
+    if mark_metadata {
+        state.mark_metadata(db_hash, COMPILER_VERSION);
+    }
     state.save(&status_path).context(IoSnafu {
         action: "Failed to write compile state",
         path: status_path,
@@ -777,7 +805,7 @@ fn detect_project_output_collisions(work: &[(PathBuf, PathBuf)]) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_compile_source_files, compile_project, decompile_project,
+        collect_compile_source_files, compile_project, decompile_project, decompile_project_files,
         detect_project_output_collisions, project_output_path, project_root_pairs,
         relative_project_path,
     };
@@ -786,6 +814,7 @@ mod tests {
         DatabaseConfig, PathsConfig, ProjectMetadata, ProjectTypeConfig, RotomConfig,
         WorkspaceConfig,
     };
+    use crate::project::error::ProjectError;
     use crate::{DatabaseV2, GameFamily};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1097,6 +1126,48 @@ mod tests {
 
         assert!(result.is_success());
         assert!(root.join("scripts/0001.rotom").exists());
+    }
+
+    #[test]
+    fn decompile_project_files_writes_only_the_named_sources() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("scripts/0001.rotom"),
+            "script Main #1:\n    End\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("scripts/0002.rotom"),
+            "script Main #1:\n    End\n",
+        )
+        .unwrap();
+        let config = project_config(ProjectTypeConfig::Dspre);
+
+        compile_project(root, &config, false).unwrap();
+        fs::write(root.join("scripts/0001.rotom"), "stale").unwrap();
+        fs::write(root.join("scripts/0002.rotom"), "untouched").unwrap();
+
+        let result = decompile_project_files(root, &config, &[root.join("build/scripts/0001")])
+            .expect("single-file project decompile should succeed");
+
+        assert!(result.is_success());
+        assert_eq!(result.successes.len(), 1);
+        assert_ne!(
+            fs::read_to_string(root.join("scripts/0001.rotom")).unwrap(),
+            "stale"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("scripts/0002.rotom")).unwrap(),
+            "untouched"
+        );
+
+        let missing = decompile_project_files(root, &config, &[root.join("build/scripts/9999")]);
+        assert!(matches!(
+            missing,
+            Err(ProjectError::UnknownDecompileFile { .. })
+        ));
     }
 
     #[test]

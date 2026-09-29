@@ -76,6 +76,10 @@ enum Commands {
         /// Show per-file decompilation output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Project mode: decompile only this binary (repeatable)
+        #[arg(long = "file", value_name = "BINARY")]
+        files: Vec<PathBuf>,
     },
 
     /// Initialize a new Rotom project, downloading or embedding the command database and writing `rotom.toml` etc.
@@ -131,11 +135,13 @@ fn main() {
             input,
             output,
             verbose,
+            files,
         } => handle_decompile_command(
             database.as_deref(),
             input.as_deref(),
             output.as_deref(),
             *verbose,
+            files,
         ),
         Commands::Init {
             root,
@@ -200,13 +206,14 @@ fn handle_decompile_command(
     input: Option<&std::path::Path>,
     output: Option<&std::path::Path>,
     verbose: bool,
+    files: &[PathBuf],
 ) {
     let start = std::time::Instant::now();
     let result = if database.is_none() && input.is_none() {
         if output.is_some() {
             Err(ProjectError::UnsupportedProjectDecompileArgs)
         } else {
-            decompile_project_mode().and_then(|result| {
+            decompile_project_mode(files).and_then(|result| {
                 report_decompile_result(&result, verbose, Some(start.elapsed()));
                 if result.is_success() {
                     Ok(())
