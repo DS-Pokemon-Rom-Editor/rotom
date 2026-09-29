@@ -149,7 +149,13 @@ pub fn global_include_path(
 }
 
 fn resolve_config_path(root: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
+    // A rotom.toml written on Windows can hold backslashes, which are not separators elsewhere.
+    let path = if cfg!(windows) {
+        path.to_string()
+    } else {
+        path.replace('\\', "/")
+    };
+    let path = Path::new(&path);
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -165,7 +171,19 @@ mod tests {
     };
     use crate::database::GameFamily;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn backslash_paths_from_a_windows_rotom_toml_resolve_everywhere() {
+        let root = Path::new("project");
+        assert_eq!(
+            super::resolve_config_path(root, r".rotom\command_database\hgss_v2.json"),
+            root.join(".rotom")
+                .join("command_database")
+                .join("hgss_v2.json")
+        );
+    }
 
     #[test]
     fn find_project_root_walks_upward() {

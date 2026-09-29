@@ -541,8 +541,9 @@ fn build_config(root: &Path, workspace: &WorkspaceInfo, default_db: Option<&Path
             include_roots: workspace.include_roots.clone(),
             binary_roots: workspace.binary_roots.clone(),
         },
+        // Forward slashes work on every platform, so a project moves between Windows and Linux.
         database: default_db.map(|path| DatabaseConfig {
-            default_file: path.display().to_string(),
+            default_file: path.display().to_string().replace('\\', "/"),
         }),
     }
 }
