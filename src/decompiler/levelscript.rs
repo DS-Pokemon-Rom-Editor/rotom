@@ -779,10 +779,13 @@ mod tests {
         ));
     }
 
+    /// Confirms configured levelscript padding is appended after normal serialization.
     #[test]
     fn compile_json_applies_levelscript_padding() {
-        let mut quirk = crate::BinaryQuirk::default();
-        quirk.levelscript_padding = Some(4);
+        let quirk = crate::BinaryQuirk {
+            levelscript_padding: Some(4),
+            ..crate::BinaryQuirk::default()
+        };
 
         // Empty levelscript serializes to 4 zero bytes; padding adds 4 more.
         let bytes =
