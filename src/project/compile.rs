@@ -396,6 +396,7 @@ pub fn decompile_project(root: &Path, config: &RotomConfig) -> Result<BatchDecom
 }
 
 /// Decompile only `files` with the full project context, or every binary when `files` is empty.
+///
 /// Only a full run marks the compile state as current, so a partial run never hides a rebuild the
 /// other entries need.
 pub fn decompile_project_files(
