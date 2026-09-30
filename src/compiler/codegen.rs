@@ -46,6 +46,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Emit a complete script binary and resolve all jump and action relocations.
     pub fn emit_script_file(
         &mut self,
         items: &[TopLevelItem],
@@ -53,27 +54,19 @@ impl<'a> Emitter<'a> {
     ) -> ParseResult<Vec<u8>> {
         // Collect jump table slots from all functions.
         // Source slot IDs are 1-based; subtract 1 for the binary jump table index.
-        self.jump_table_slots = items
-            .iter()
-            .filter_map(|item| {
-                if let TopLevelItem::Function(f) = item {
-                    Some(
-                        f.jump_table_slots()
-                            .map(|(id, name)| {
-                                debug_assert!(
-                                    id >= 1,
-                                    "slot ID 0 must be rejected by analysis before codegen"
-                                );
-                                (id - 1, name)
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect();
+        self.jump_table_slots.clear();
+        for item in items {
+            if let TopLevelItem::Function(function) = item {
+                self.jump_table_slots
+                    .extend(function.jump_table_slots().map(|(id, name)| {
+                        debug_assert!(
+                            id >= 1,
+                            "slot ID 0 must be rejected by analysis before codegen"
+                        );
+                        (id - 1, name)
+                    }));
+            }
+        }
         // Sort by slot ID to ensure correct ordering
         self.jump_table_slots.sort_by_key(|(slot_id, _)| *slot_id);
 
