@@ -53,6 +53,9 @@ pub enum ProjectError {
     #[snafu(display("No project binary files were found"))]
     NoProjectBinaryFiles,
 
+    #[snafu(display("'{}' is not a binary under any of the project's binary_roots", path.display()))]
+    UnknownDecompileFile { path: std::path::PathBuf },
+
     #[snafu(display("Project compile output collision detected: {details}"))]
     OutputCollision { details: String },
 

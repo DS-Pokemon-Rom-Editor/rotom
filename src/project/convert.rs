@@ -559,7 +559,7 @@ pub fn convert_project(
 
     if !options.dry_run && !dspre_from_binary_successes.is_empty() {
         let db_hash = dspre_db_hash.expect("DSPRE convert records DB hash above");
-        update_decompile_state(root, config, db_hash, &dspre_from_binary_successes)?;
+        update_decompile_state(root, config, db_hash, &dspre_from_binary_successes, true)?;
     }
 
     if !options.dry_run {
