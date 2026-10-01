@@ -1217,6 +1217,35 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_keeps_code_nothing_jumps_to_after_a_movement() {
+        // Retail Diamond script 230 has this shape: a movement, then a routine nothing calls whose last cell
+        // reads as a movement opcode, then that routine's own movement.
+        let bin: Vec<u8> = [
+            &[0x02, 0x00, 0x00, 0x00, 0x13, 0xFD][..], // script 1 at 6, jump table end
+            &[0x5E, 0x00, 0xFF, 0x00, 0x02, 0x00, 0x00, 0x00], // ApplyMovement 255 -> 16
+            &[0x02, 0x00],                             // End
+            &[0x3F, 0x00, 0x01, 0x00, 0xFE, 0x00, 0x00, 0x00], // movement at 16
+            &[0x69, 0x00, 0x04, 0x80, 0x05, 0x80],     // unreferenced: GetPlayerMapPos
+            &[0x5E, 0x00, 0xF1, 0x00, 0x02, 0x00, 0x00, 0x00], // ApplyMovement 241 -> 40
+            &[0x1B, 0x00],                             // Return
+            &[0x13, 0x00, 0x02, 0x00, 0xFE, 0x00, 0x00, 0x00], // movement at 40
+        ]
+        .concat();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("build/scripts")).unwrap();
+        fs::write(root.join("build/scripts/0001"), &bin).unwrap();
+        let config = project_config(ProjectTypeConfig::Dspre);
+
+        let result = decompile_project(root, &config).expect("project decompile should succeed");
+        assert!(result.is_success());
+        compile_project(root, &config, true).unwrap();
+
+        assert_eq!(fs::read(root.join("build/scripts/0001")).unwrap(), bin);
+    }
+
+    #[test]
     fn decompile_project_updates_compile_state_for_generated_sources() {
         let dir = tempdir().unwrap();
         let root = dir.path();

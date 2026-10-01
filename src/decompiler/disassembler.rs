@@ -705,6 +705,17 @@ impl<'a> Disassembler<'a> {
                     pos
                 };
 
+                // Bytes ahead of the sequence that are not padding are code nothing jumps to; stop here so
+                // the caller decodes them instead of dropping them.
+                let lead = action_start.saturating_sub(current_start);
+                let is_padding = lead < 4
+                    && self.bytes[current_start..action_start]
+                        .iter()
+                        .all(|&b| b == 0);
+                if lead > 0 && !is_padding {
+                    break;
+                }
+
                 if action_start <= term_pos {
                     self.action_offsets.insert(action_start);
 
