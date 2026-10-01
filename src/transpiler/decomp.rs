@@ -1223,12 +1223,33 @@ Helper:
         );
     }
 
+    /// Exact database keys win over opcode alias rewriting: a command keyed
+    /// `ScrCmd_055` keeps that name even though the same spelling alias-parses
+    /// to command id 55.
     #[test]
     fn test_resolve_script_command_name_keeps_exact_scrcmd_key() {
-        let db = crate::database::DatabaseV2::test_hgss();
+        // Fixture mirrors the scrcmd-database naming anomaly this guard was
+        // added for: an unnamed command keyed `ScrCmd_055` carrying opcode 56,
+        // while opcode 55 is the named `DirectionSignpost`. The key itself is
+        // inserted so the test does not depend on upstream command naming.
+        let mut db =
+            crate::database::DatabaseV2::load(crate::database::DatabaseV2::test_hgss_path())
+                .expect("hgss test db should load");
+        db.commands.insert(
+            "ScrCmd_055".to_string(),
+            crate::database::Command {
+                cmd_type: crate::database::CommandType::ScriptCmd,
+                id: Some(56),
+                legacy_name: None,
+                description: None,
+                params: Vec::new(),
+                variants: None,
+                expansion: None,
+            },
+        );
 
         assert_eq!(
-            resolve_script_command_name("ScrCmd_055", Some(db)).as_ref(),
+            resolve_script_command_name("ScrCmd_055", Some(&db)).as_ref(),
             "ScrCmd_055"
         );
     }
