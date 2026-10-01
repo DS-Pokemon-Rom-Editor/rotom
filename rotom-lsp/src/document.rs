@@ -67,7 +67,9 @@ impl DocumentCache {
 /// Build grouped document symbols.
 ///
 /// Scripts, aliases, labels, and actions are bucketed into collapsible parent nodes
-/// so the editor outline shows them grouped by kind.
+/// so the editor outline shows them grouped by kind. Script symbols carry their
+/// jump-table slot as `detail` (`#N`), which is what events and callers reference,
+/// so clients can jump to "script number N" without reparsing the source.
 pub fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
     let Some(file) = parse_source(source) else {
         return Vec::new();
@@ -84,20 +86,14 @@ pub fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
         match &item.node {
             StatementKind::Function { headers, .. } => {
                 for header in headers {
+                    // One header per claimed jump-table slot, so `#N` identifies this
+                    // symbol even when several headers share one body.
+                    let mut symbol = make_symbol(&header.name, SymbolKind::FUNCTION, &item.span, &map);
+                    symbol.detail = header.id.map(|id| format!("#{id}"));
                     if header.is_public {
-                        scripts.push(make_symbol(
-                            &header.name,
-                            SymbolKind::FUNCTION,
-                            &item.span,
-                            &map,
-                        ));
+                        scripts.push(symbol);
                     } else {
-                        labels.push(make_symbol(
-                            &header.name,
-                            SymbolKind::FUNCTION,
-                            &item.span,
-                            &map,
-                        ));
+                        labels.push(symbol);
                     }
                 }
             }
@@ -238,6 +234,61 @@ Helper:
             .expect("Labels group should have children");
         assert_eq!(labels[0].name, "Helper");
         assert_eq!(labels[0].kind, SymbolKind::FUNCTION);
+    }
+
+    #[test]
+    fn document_symbols_expose_jump_table_slots_as_detail() {
+        let symbols = compute_document_symbols(
+            r#"script SlotOne #1:
+    End
+
+script StackedA #5:
+script StackedB #6:
+    End
+
+script Ranged #[3, 8-10]:
+    End
+
+Helper:
+    Return
+
+action Walk:
+    EndMovement
+"#,
+        );
+
+        let scripts = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Scripts")
+            .and_then(|symbol| symbol.children.as_ref())
+            .expect("Scripts group should have children");
+        let slots: Vec<(&str, Option<&str>)> = scripts
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.detail.as_deref()))
+            .collect();
+        assert_eq!(
+            slots,
+            vec![
+                ("SlotOne", Some("#1")),
+                ("StackedA", Some("#5")),
+                ("StackedB", Some("#6")),
+                // A bracketed slot list claims one jump-table slot per symbol.
+                ("Ranged", Some("#3")),
+                ("Ranged", Some("#8")),
+                ("Ranged", Some("#9")),
+                ("Ranged", Some("#10")),
+            ]
+        );
+
+        // Labels and actions are not in the jump table and carry no slot.
+        for group in ["Labels", "Actions"] {
+            let children = symbols
+                .iter()
+                .find(|symbol| symbol.name == group)
+                .and_then(|symbol| symbol.children.as_ref())
+                .unwrap_or_else(|| panic!("{group} group should have children"));
+            assert!(children.iter().all(|symbol| symbol.detail.is_none()));
+        }
     }
 
     #[test]
