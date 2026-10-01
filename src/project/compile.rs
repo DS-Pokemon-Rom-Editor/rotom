@@ -651,6 +651,11 @@ fn collect_project_decompile_work(
         })?;
 
         for input in files {
+            // An empty member holds no script (retail Diamond ships one), so there is nothing to decompile
+            // and compile leaves a binary without a source as it is.
+            if fs::metadata(&input).is_ok_and(|meta| meta.len() == 0) {
+                continue;
+            }
             let relative = input.strip_prefix(&binary_root).unwrap_or(&input);
             let output_dir = match relative.parent() {
                 Some(parent) => source_root.join(parent),
@@ -1169,6 +1174,46 @@ mod tests {
             missing,
             Err(ProjectError::UnknownDecompileFile { .. })
         ));
+    }
+
+    #[test]
+    fn decompile_project_leaves_empty_binaries_alone() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("scripts/0001.rotom"),
+            "script Main #1:
+    End
+",
+        )
+        .unwrap();
+        let config = project_config(ProjectTypeConfig::Dspre);
+
+        compile_project(root, &config, false).unwrap();
+        fs::write(root.join("build/scripts/0002"), []).unwrap();
+        fs::remove_file(root.join("scripts/0001.rotom")).unwrap();
+
+        let result = decompile_project(root, &config).expect("project decompile should succeed");
+
+        assert!(
+            result.is_success(),
+            "failures: {:?}",
+            result
+                .failures
+                .iter()
+                .map(|f| f.error.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(result.successes.len(), 1);
+        assert!(root.join("scripts/0001.rotom").exists());
+        assert!(!root.join("scripts/0002.rotom").exists());
+
+        compile_project(root, &config, false).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("build/scripts/0002")).unwrap().len(),
+            0
+        );
     }
 
     #[test]
