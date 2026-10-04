@@ -172,6 +172,12 @@ pub struct DatabaseMeta {
     pub generated_at: Option<String>,
     #[serde(default)]
     pub generated_from: Option<String>,
+    /// Decomp repository slug (`owner/repo`) the command data was synced from.
+    #[serde(default)]
+    pub decomp_repo: Option<String>,
+    /// Commit of [`Self::decomp_repo`] the command data was synced from.
+    #[serde(default)]
+    pub decomp_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1446,6 +1452,8 @@ mod tests {
                 version: version.to_string(),
                 generated_at: None,
                 generated_from: None,
+                decomp_repo: None,
+                decomp_commit: None,
             },
             commands,
             sounds: HashMap::new(),
@@ -1457,6 +1465,36 @@ mod tests {
 
     fn test_db_for_legacy_lookup() -> DatabaseV2 {
         test_db_for_legacy_lookup_with_version("test")
+    }
+
+    /// Decomp provenance field names must match what `sync_from_decomp.py`
+    /// writes, otherwise fixture consistency checks silently see nothing.
+    #[test]
+    fn test_meta_deserializes_decomp_provenance() {
+        let meta: DatabaseMeta = serde_json::from_str(
+            r#"{
+                "version": "HeartGold/SoulSilver",
+                "decomp_repo": "pret/pokeheartgold",
+                "decomp_commit": "9d8b7591f09b65804da2fb2dfd56f320633e0d36"
+            }"#,
+        )
+        .expect("meta should deserialize");
+
+        assert_eq!(meta.decomp_repo.as_deref(), Some("pret/pokeheartgold"));
+        assert_eq!(
+            meta.decomp_commit.as_deref(),
+            Some("9d8b7591f09b65804da2fb2dfd56f320633e0d36")
+        );
+    }
+
+    #[test]
+    fn test_meta_tolerates_missing_decomp_provenance() {
+        let meta: DatabaseMeta =
+            serde_json::from_str(r#"{"version": "HeartGold/SoulSilver"}"#)
+                .expect("meta should deserialize");
+
+        assert_eq!(meta.decomp_repo, None);
+        assert_eq!(meta.decomp_commit, None);
     }
 
     #[test]

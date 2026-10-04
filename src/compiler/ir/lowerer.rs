@@ -1993,6 +1993,8 @@ mod tests {
                 version: "test".to_string(),
                 generated_at: None,
                 generated_from: None,
+                decomp_repo: None,
+                decomp_commit: None,
             },
             commands,
             sounds: HashMap::new(),

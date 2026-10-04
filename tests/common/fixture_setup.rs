@@ -12,6 +12,12 @@ static FIXTURE_INIT: Once = Once::new();
 
 /// Ensure all decomp fixtures are present. Auto-clones via git if missing.
 ///
+/// Each fixture is checked out at the decomp revision the embedded command
+/// database was synced from, so database and fixture cannot drift apart. The
+/// pinned commits are only a fallback for databases that predate provenance
+/// tracking; using one is worth a warning because it is exactly the drift that
+/// broke compilation before.
+///
 /// Uses `std::sync::Once` so that even when `cargo test` runs tests in
 /// parallel within the same binary, git operations happen exactly once.
 pub fn ensure_decomp_fixtures() {
@@ -20,9 +26,26 @@ pub fn ensure_decomp_fixtures() {
         std::fs::create_dir_all(root.join("decomp")).expect("Failed to create fixtures/decomp");
 
         for pin in ALL_PINS {
+            let db = match pin.name {
+                "pokeheartgold" => Some(rotom::database::DatabaseV2::test_hgss()),
+                "pokeplatinum" => Some(rotom::database::DatabaseV2::test_platinum()),
+                _ => None,
+            };
+            let commit = match db.and_then(|db| db.meta.decomp_commit.as_deref()) {
+                Some(commit) => commit,
+                None => {
+                    eprintln!(
+                        "[fixtures] {} database carries no decomp provenance; \
+                         falling back to pinned commit {}",
+                        pin.name, pin.commit
+                    );
+                    pin.commit
+                }
+            };
+
             let dest = root.join("decomp").join(pin.name);
             if dest.exists() {
-                match verify_commit(&dest, pin.commit) {
+                match verify_commit(&dest, commit) {
                     Ok(true) => continue,
                     Ok(false) => {
                         eprintln!(
@@ -47,8 +70,8 @@ pub fn ensure_decomp_fixtures() {
                 dest.display()
             );
             clone_or_die(pin.repo_url, &dest);
-            checkout_or_die(&dest, pin.commit);
-            println!("[fixtures] {} ready at {}", pin.name, pin.commit);
+            checkout_or_die(&dest, commit);
+            println!("[fixtures] {} ready at {}", pin.name, commit);
         }
     });
 }
