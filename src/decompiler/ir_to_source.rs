@@ -18,14 +18,19 @@ pub fn ir_to_source(output: &ScriptOutput, context: DecompileContext<'_>) -> Str
     }
 }
 
-/// Map a parameter name from the command database to a Uxie constant family.
-/// Not perfect given how variable the naming used by the decomps is.
-/// Map a command parameter name to the constant family used for reverse lookup.
-fn param_semantic_family(
+/// How a recognized command parameter should be rendered.
+enum ParamSemantics {
+    Literal,
+    Family(uxie::ConstantFamily),
+}
+
+/// Classify a command parameter name, returning `None` for unrecognized names.
+fn param_semantics(
     param_name: &str,
     game_family: Option<crate::database::GameFamily>,
-) -> Option<uxie::ConstantFamily> {
-    match param_name.to_ascii_lowercase().as_str() {
+) -> Option<ParamSemantics> {
+    let family = match param_name.to_ascii_lowercase().as_str() {
+        "val" | "value" => return Some(ParamSemantics::Literal),
         "item" | "itemid" | "item_id" => Some(uxie::ConstantFamily::Item),
         "species" | "pokemon" | "pokémon" | "pokémon_id" => Some(uxie::ConstantFamily::Species),
         "move" | "moveid" | "move_id" => Some(uxie::ConstantFamily::Move),
@@ -48,9 +53,11 @@ fn param_semantic_family(
         "ability" => Some(uxie::ConstantFamily::Ability),
         "type" | "type_1" | "type_2" => Some(uxie::ConstantFamily::Type),
         _ => None,
-    }
+    };
+    family.map(ParamSemantics::Family)
 }
 
+/// Format an argument, keeping `val` and `value` parameters numeric.
 fn format_arg(
     arg: &Arg,
     param_name: Option<&str>,
@@ -64,16 +71,22 @@ fn format_arg(
             {
                 return cond.as_str().to_string();
             }
-            if let Some(name) = param_name
-                && let Some(family) = param_semantic_family(name, game_family)
-                && let Some(constants) = constants
-                && let Some(resolved) = constants.resolve_value_to_name(i64::from(*v), family)
-            {
-                return resolved;
-            } else if let Some(resolved) = constants.and_then(|c| {
-                c.resolve_value_to_name(i64::from(*v), uxie::ConstantFamily::Variable)
-            }) {
-                return resolved;
+            match param_name.and_then(|name| param_semantics(name, game_family)) {
+                Some(ParamSemantics::Literal) => {}
+                semantics => {
+                    if let Some(ParamSemantics::Family(family)) = semantics
+                        && let Some(constants) = constants
+                        && let Some(resolved) =
+                            constants.resolve_value_to_name(i64::from(*v), family)
+                    {
+                        return resolved;
+                    }
+                    if let Some(resolved) = constants.and_then(|c| {
+                        c.resolve_value_to_name(i64::from(*v), uxie::ConstantFamily::Variable)
+                    }) {
+                        return resolved;
+                    }
+                }
             }
             if *v >= 0x4000 {
                 return format!("0x{:X}", v);
@@ -621,6 +634,70 @@ mod tests {
             source.contains("SetFlag FLAG_TEST"),
             "expected symbolic flag, got: {source}"
         );
+    }
+
+    /// Literal parameters stay numeric even when their values have symbolic aliases.
+    #[test]
+    fn test_literal_args_preserve_numeric_values_and_variable_fallback() {
+        let mut symbols = uxie::SymbolTable::new();
+        symbols.insert_define("MAPTEMP_FLAG_BASE".to_string(), 1);
+        symbols.insert_define("VAR_SPECIAL_x8005".to_string(), 0x8005);
+        let mut constants = ConstantDb::new();
+        constants.load_decomp_symbols(".", symbols);
+
+        assert!(matches!(
+            param_semantics("destVarID", None),
+            Some(ParamSemantics::Family(uxie::ConstantFamily::Variable)),
+        ));
+
+        for (db, command) in [
+            (DatabaseV2::test_platinum(), "SetVarFromValue"),
+            (DatabaseV2::test_hgss(), "SetVar"),
+        ] {
+            for (value, expected) in [(1, "1"), (0x8005, "0x8005")] {
+                let (formatted, annotation) = format_command_args(
+                    command,
+                    &[Arg::Value(0x8005), Arg::Value(value)],
+                    DecompileContext::standalone(db, Some(&constants)),
+                );
+                assert_eq!(formatted, ["VAR_SPECIAL_x8005", expected], "{command}");
+                assert_eq!(annotation, None);
+            }
+        }
+
+        for name in ["val", "value", "VaL", "VALUE"] {
+            assert!(matches!(
+                param_semantics(name, None),
+                Some(ParamSemantics::Literal),
+            ));
+            for (value, expected) in [(1, "1"), (0x8005, "0x8005")] {
+                assert_eq!(
+                    format_arg(
+                        &Arg::Value(value),
+                        Some(name),
+                        Some(&constants),
+                        Some(crate::database::GameFamily::HGSS),
+                    ),
+                    expected,
+                    "{name}",
+                );
+            }
+        }
+
+        for name in [Some("valueOrVarID"), Some("number"), None] {
+            if let Some(name) = name {
+                assert!(param_semantics(name, None).is_none());
+            }
+            assert_eq!(
+                format_arg(
+                    &Arg::Value(0x8005),
+                    name,
+                    Some(&constants),
+                    Some(crate::database::GameFamily::HGSS),
+                ),
+                "VAR_SPECIAL_x8005",
+            );
+        }
     }
 
     #[test]
