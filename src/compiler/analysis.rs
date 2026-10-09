@@ -807,6 +807,13 @@ impl<'a> Analyzer<'a> {
         span: &Range<usize>,
     ) -> ParseResult<()> {
         let Some(cmd) = self.get_command(command) else {
+            // Lowering needs a database entry for every command.
+            if self.database.is_some() {
+                return Err(analysis_error(
+                    span.clone(),
+                    format!("Unknown command '{}'", command),
+                ));
+            }
             return Ok(());
         };
 
@@ -2367,6 +2374,35 @@ script Test #1:
             result.is_ok(),
             "Without database, unknown commands should be allowed: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn test_analyzer_with_database_rejects_unknown_command() {
+        use crate::compiler::lexer::Lexer;
+        use crate::compiler::parser::Parser;
+        use crate::database::DatabaseV2;
+
+        let source = r"
+script Test #1:
+    SetFlag 100 
+    oops
+    End
+";
+        let db = DatabaseV2::test_platinum();
+        let mut constants = ConstantDb::new();
+        constants.load_from_db(db);
+
+        let lexer = Lexer::new(source);
+        let mut parser = Parser::new(lexer);
+        let script_file = parser.parse_script_file().unwrap();
+
+        let mut analyzer = Analyzer::with_database(&constants, db);
+        let err_msg = format!("{:?}", analyzer.analyze(&script_file).err());
+        assert!(
+            err_msg.contains("Unknown command 'oops'"),
+            "An unknown command should fail analysis: {}",
+            err_msg
         );
     }
 
