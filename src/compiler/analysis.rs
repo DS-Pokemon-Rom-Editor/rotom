@@ -2385,7 +2385,8 @@ script Test #1:
 
         let source = r"
 script Test #1:
-    SetFlag 100 oops
+    SetFlag 100 
+    oops
     End
 ";
         let db = DatabaseV2::test_platinum();
