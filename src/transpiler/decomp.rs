@@ -289,10 +289,12 @@ fn render_label_line(
     if let Some(slots) = prepass.function_to_slots.get(label_name) {
         // Public script (in jump table): emit header for each slot.
         // Jump table indices are 0-based; source slot IDs are 1-based.
+        // The colon precedes the comment: a trailing `//` comment would
+        // otherwise swallow it during lexing.
         for slot in slots {
-            let _ = write!(output, "script {} #{}", label_name, slot + 1);
+            let _ = write!(output, "script {} #{}:", label_name, slot + 1);
             append_inline_comment(output, inline_comment);
-            output.push_str(":\n");
+            output.push('\n');
         }
         return Ok(());
     }
@@ -368,6 +370,32 @@ fn process_content_line(
     Ok(())
 }
 
+/// Byte index of the first comment marker (`@`, `;`, `//`) outside a
+/// double-quoted string, if any. String contents (e.g. URLs) never start
+/// comments, mirroring the assembler; a `Label: // note` definition still
+/// parses as a label with an inline comment.
+fn find_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 1;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else if c == b'"' {
+            in_string = true;
+        } else if c == b'@' || c == b';' || (c == b'/' && bytes.get(i + 1) == Some(&b'/')) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn preprocess_body_line(raw_trimmed: &str) -> BodyLine<'_> {
     if raw_trimmed.is_empty() {
         return BodyLine::Empty;
@@ -405,17 +433,18 @@ fn preprocess_body_line(raw_trimmed: &str) -> BodyLine<'_> {
         return BodyLine::FullComment(comment);
     }
 
-    let comment_start = [raw_trimmed.find('@'), raw_trimmed.find(';')]
-        .into_iter()
-        .flatten()
-        .min();
+    let comment_start = find_comment_start(raw_trimmed);
 
     let (trimmed, inline_comment) = if let Some(idx) = comment_start {
-        let comment_marker = raw_trimmed[idx..].chars().next().unwrap();
-        (
-            raw_trimmed[..idx].trim(),
-            Some(raw_trimmed[idx..].replacen(comment_marker, "//", 1)),
-        )
+        let rest = &raw_trimmed[idx..];
+        // `//` comments keep their marker; `@`/`;` are normalized to `//`.
+        let comment = if rest.starts_with("//") {
+            rest.to_string()
+        } else {
+            let marker = rest.chars().next().unwrap();
+            rest.replacen(marker, "//", 1)
+        };
+        (raw_trimmed[..idx].trim(), Some(comment))
     } else {
         (raw_trimmed, None)
     };
@@ -790,24 +819,40 @@ fn resolve_opcode_alias(db: &crate::database::DatabaseV2, cmd_name: &str) -> Opt
 /// Decomp `.macro` definitions can either keep args in binary order or move optional args
 /// (those with `=DEFAULT` syntax) to the end. A param having a `default` in the v2 DB does not
 /// mean the macro allows omitting it — some defaults are binary-level only. This function
-/// uses `macro_optional_indices` (parsed from `scrcmd.inc`) to identify which binary param
+/// uses `macro_optional` (parsed from `scrcmd.inc`) to identify which binary param
 /// positions are actually omittable in the macro.
+///
+/// Separately, decomp macros often omit *leading* dummy params that are hardcoded in the
+/// macro body (e.g. `.short 0 // unused`); the database marks those params with defaults.
+/// A call that is short by exactly such a leading run gets it filled in below.
+///
+/// Wrapper (`macro`-type) commands are exempt: their database params mirror the macro
+/// signature, so a short call there always omits trailing params.
 fn reorder_decomp_args_to_binary(
     cmd_name: &str,
     args_str: &str,
     db: &crate::database::DatabaseV2,
-    macro_optional_indices: &HashMap<String, HashSet<usize>>,
+    macro_optional: &HashMap<String, HashSet<usize>>,
 ) -> String {
     let Ok(cmd) = db.get_command(cmd_name) else {
         return args_str.to_owned();
     };
+
+    // Wrapper macros mirror their signature in the database params and fill
+    // omitted trailing params from defaults at expansion time, so their calls
+    // never need binary-order rewriting. Only real commands get here.
+    if cmd.cmd_type == crate::database::CommandType::Macro {
+        return args_str.to_owned();
+    }
 
     let params = &cmd.params;
     if params.is_empty() {
         return args_str.to_owned();
     }
 
-    let cmd_optional = macro_optional_indices.get(cmd_name);
+    let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
+
+    let cmd_optional = macro_optional.get(cmd_name);
     let mut required_indices: Vec<usize> = Vec::new();
     let mut optional_indices: Vec<usize> = Vec::new();
     for (i, p) in params.iter().enumerate() {
@@ -821,41 +866,63 @@ fn reorder_decomp_args_to_binary(
         }
     }
 
-    if optional_indices.is_empty() {
+    // Decomp macros often omit a leading run of dummy params that are
+    // hardcoded in the macro body (e.g. `.short 0 // unused`); the database
+    // marks those params with defaults. Expand that prefix so the call below
+    // aligns with the binary parameter order. Only when the macro declares no
+    // `=DEFAULT` optionals: otherwise a short call omits trailing optionals,
+    // which the existing logic below already handles.
+    let mut omitted_leading = 0;
+    if cmd_optional.is_none_or(HashSet::is_empty) {
+        while omitted_leading < params.len()
+            && params.len() - omitted_leading > args.len()
+            && params[omitted_leading].default.is_some()
+            && !is_autovar_param(&params[omitted_leading])
+        {
+            omitted_leading += 1;
+        }
+    }
+
+    if optional_indices.is_empty() && omitted_leading == 0 {
         return args_str.to_owned();
     }
 
-    let all_optional_at_end = optional_indices
-        .iter()
-        .all(|&i| i >= required_indices.len());
+    let all_optional_at_end = omitted_leading == 0
+        && optional_indices
+            .iter()
+            .all(|&i| i >= required_indices.len());
     if all_optional_at_end {
         return args_str.to_owned();
     }
 
-    let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
+    let full_args: Vec<&str> = params[..omitted_leading]
+        .iter()
+        .map(|p| p.default.as_deref().unwrap_or_default())
+        .chain(args.iter().copied())
+        .collect();
 
     let req_count = required_indices.len();
     let total_params = params.len();
 
-    if args.len() < req_count || args.len() > total_params {
+    if full_args.len() < req_count || full_args.len() > total_params {
         return args_str.to_owned();
     }
 
-    let provided_optional_count = args.len() - req_count;
+    let provided_optional_count = full_args.len() - req_count;
 
     let mut result: Vec<Option<&str>> = vec![None; total_params];
 
     for (decomp_idx, &binary_idx) in required_indices.iter().enumerate() {
-        if decomp_idx < args.len() {
-            result[binary_idx] = Some(args[decomp_idx]);
+        if decomp_idx < full_args.len() {
+            result[binary_idx] = Some(full_args[decomp_idx]);
         }
     }
 
     for (opt_num, &binary_idx) in optional_indices.iter().enumerate() {
         if opt_num < provided_optional_count {
             let decomp_idx = req_count + opt_num;
-            if decomp_idx < args.len() {
-                result[binary_idx] = Some(args[decomp_idx]);
+            if decomp_idx < full_args.len() {
+                result[binary_idx] = Some(full_args[decomp_idx]);
             }
         } else {
             result[binary_idx] = Some(params[binary_idx].default.as_deref().unwrap_or_default());
@@ -927,6 +994,13 @@ fn expand_one_generated_include(include_line: &str, decomp_root: &Path) -> Optio
             let header =
                 std::fs::read_to_string(decomp_root.join("include/data/field/hidden_items.h"))
                     .ok()?;
+            let flag_values = std::fs::read_to_string(decomp_root.join("generated/vars_flags.txt"))
+                .ok()
+                .and_then(|text| eval_sequential_flags(&text));
+            let start = flag_values
+                .as_ref()
+                .and_then(|values| values.get("HIDDEN_ITEM_FLAGS_START"))
+                .copied();
             let max_id = header
                 .lines()
                 .filter_map(|line| {
@@ -939,7 +1013,14 @@ fn expand_one_generated_include(include_line: &str, decomp_root: &Path) -> Optio
                     let close = line.rfind(')')?;
                     let before_close = &line[..close];
                     let last_comma = before_close.rfind(',')?;
-                    before_close[last_comma + 1..].trim().parse::<usize>().ok()
+                    let script = before_close[last_comma + 1..].trim();
+                    // Raw id in older revisions; flag name evaluated like
+                    // itemproc (`flag - HIDDEN_ITEM_FLAGS_START`) in current ones.
+                    if let Ok(id) = script.parse::<usize>() {
+                        return Some(id);
+                    }
+                    let flag = flag_values.as_ref()?.get(script)?;
+                    usize::try_from(flag - start?).ok()
                 })
                 .max()?;
             let mut out = String::new();
@@ -950,6 +1031,47 @@ fn expand_one_generated_include(include_line: &str, decomp_root: &Path) -> Optio
             Some(out)
         }
         _ => None,
+    }
+}
+
+/// Evaluate `generated/vars_flags.txt`-style sequential definitions.
+///
+/// A bare `NAME` continues from the previous value + 1 (starting at 0); a
+/// `NAME = EXPR` line pins a value where EXPR is a decimal/hex number or a
+/// previously defined name. Returns `None` on any unrecognized line or
+/// forward reference — callers treat that as "cannot mirror the generator"
+/// and keep their previous behavior.
+fn eval_sequential_flags(text: &str) -> Option<HashMap<String, i64>> {
+    let mut values = HashMap::new();
+    let mut current: i64 = -1;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, expr)) = line.split_once('=') {
+            let value = parse_flag_expr(expr.trim(), &values)?;
+            values.insert(name.trim().to_string(), value);
+            current = value;
+        } else {
+            if line.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                return None;
+            }
+            current += 1;
+            values.insert(line.to_string(), current);
+        }
+    }
+    Some(values)
+}
+
+/// Evaluate one `NAME = EXPR` right-hand side: a number or a previous name.
+fn parse_flag_expr(expr: &str, values: &HashMap<String, i64>) -> Option<i64> {
+    if let Some(hex) = expr.strip_prefix("0x").or_else(|| expr.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else if let Ok(number) = expr.parse::<i64>() {
+        Some(number)
+    } else {
+        values.get(expr).copied()
     }
 }
 
@@ -1703,5 +1825,159 @@ Test:
                 .contains("    ChooseTwoCustomMessageWords 0, VAR_RESULT, VAR_0x8000, VAR_0x8001"),
             "two custom message words argument order should be preserved"
         );
+    }
+
+    #[test]
+    fn eval_sequential_flags_tracks_bare_and_aliased_values() {
+        let values =
+            eval_sequential_flags("FLAG_A\nFLAG_B\nFLAG_C = FLAG_A\nFLAG_D = 0x10\nFLAG_E\n")
+                .expect("plain definitions should evaluate");
+
+        assert_eq!(values["FLAG_A"], 0);
+        assert_eq!(values["FLAG_B"], 1);
+        assert_eq!(values["FLAG_C"], 0);
+        assert_eq!(values["FLAG_D"], 16);
+        assert_eq!(values["FLAG_E"], 17);
+    }
+
+    #[test]
+    fn eval_sequential_flags_rejects_forward_references_and_garbage() {
+        assert!(
+            eval_sequential_flags("FLAG_A = FLAG_B\nFLAG_B\n").is_none(),
+            "forward references cannot be resolved in one pass"
+        );
+        assert!(
+            eval_sequential_flags("FLAG_A = FLAG_B + 1\n").is_none(),
+            "arithmetic is out of scope for the sequential format"
+        );
+    }
+
+    /// `HIDDEN_ITEM_ENTRY` script fields are flag names in current revisions;
+    /// the expansion must evaluate them like itemproc (`flag - START`).
+    #[test]
+    fn preexpand_hidden_item_scripts_resolves_flag_script_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, content: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+        };
+        write(
+            "include/data/field/hidden_items.h",
+            "HIDDEN_ITEM_ENTRY(ITEM_A, 1, 2, FLAG_X),\n\
+             HIDDEN_ITEM_ENTRY(ITEM_B, 1, 0, FLAG_Y),\n\
+             HIDDEN_ITEM_ENTRY(ITEM_C, 1, 0, 7),\n",
+        );
+        write(
+            "generated/vars_flags.txt",
+            "HIDDEN_ITEM_FLAGS_START\nFLAG_X = HIDDEN_ITEM_FLAGS_START\nFLAG_Y\n",
+        );
+
+        let input = "#include \"res/items/hidden_item_scripts.h\"\n";
+        let output = preexpand_generated_includes(input, root);
+
+        // FLAG_X = START + 0, FLAG_Y = START + 1, raw 7: max is 7.
+        assert_eq!(output.matches("ScriptEntry HiddenItems_Item").count(), 8);
+        assert!(output.contains("ScriptEntryEnd"));
+    }
+
+    /// Decomp macros omit leading dummy params that are hardcoded in the macro
+    /// body (e.g. `.short 0 // unused`); the converter fills them from the
+    /// database defaults so the call matches the binary parameter order.
+    #[test]
+    fn transpile_fills_omitted_leading_dummy_param() {
+        let db = crate::database::DatabaseV2::test_platinum();
+        let input = r"
+    ScriptEntry Main
+    ScriptEntryEnd
+
+Main:
+    ChooseCustomMessageWord VAR_RESULT, VAR_0x8000
+    End
+";
+        let output = transpile(input, Some(db), None).expect("transpile should succeed");
+        assert!(
+            output
+                .source
+                .contains("ChooseCustomMessageWord 0, VAR_RESULT, VAR_0x8000"),
+            "omitted leading dummy param should be filled from the default: {}",
+            output.source
+        );
+    }
+
+    /// A short call to a macro with `=DEFAULT` trailing params omits those,
+    /// not a leading defaulted param: `FadeScreenIn MEDIUM` means
+    /// frames=MEDIUM with color omitted.
+    #[test]
+    fn transpile_keeps_trailing_optional_omission() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("asm/macros/scrcmd.inc");
+        std::fs::create_dir_all(inc.parent().unwrap()).unwrap();
+        std::fs::write(
+            &inc,
+            ".macro FadeScreenIn frames = FADE_SCREEN_SPEED_FAST, color = COLOR_BLACK\n\
+             .short 100\n\
+             .short \\frames\n\
+             .short \\color\n\
+             .endm\n",
+        )
+        .unwrap();
+
+        let db = crate::database::DatabaseV2::test_platinum();
+        let input = r"
+    ScriptEntry Main
+    ScriptEntryEnd
+
+Main:
+    FadeScreenIn FADE_SCREEN_SPEED_MEDIUM
+    End
+";
+        let output =
+            transpile(input, Some(db), Some(dir.path())).expect("transpile should succeed");
+        assert!(
+            output
+                .source
+                .contains("FadeScreenIn FADE_SCREEN_SPEED_MEDIUM"),
+            "short call must be preserved as-is: {}",
+            output.source
+        );
+        assert!(
+            !output.source.contains("FADE_SCREEN_SPEED_FAST"),
+            "trailing omission must not steal the first arg into a phantom leading param: {}",
+            output.source
+        );
+    }
+
+    /// Labels with trailing `//` comments must still register as labels:
+    /// `Foo: // note` in the jump table becomes `script Foo #N`, not a
+    /// private label (which silently shifted every later jump-table slot).
+    #[test]
+    fn transpile_label_with_trailing_line_comment_stays_public() {
+        let db = crate::database::DatabaseV2::test_platinum();
+        let input = "ScriptEntry Foo\nScriptEntryEnd\n\nFoo: // some note\n    End\n";
+        let output = transpile(input, Some(db), None).expect("transpile should succeed");
+        assert!(
+            output.source.contains("script Foo #1: // some note"),
+            "commented label should keep its jump-table slot with the comment intact: {}",
+            output.source
+        );
+        // The emitted header must survive a compile parse: the colon has to
+        // precede the comment or the lexer swallows it.
+        let lexer = crate::compiler::lexer::Lexer::new(&output.source);
+        let mut parser = crate::compiler::Parser::new(lexer);
+        parser
+            .parse_script_file()
+            .expect("emitted header should parse");
+    }
+
+    #[test]
+    fn find_comment_start_handles_line_comments_and_strings() {
+        assert_eq!(find_comment_start("Foo: // note"), Some(5));
+        assert_eq!(find_comment_start("Foo @ note"), Some(4));
+        assert_eq!(find_comment_start("Foo ; note"), Some(4));
+        assert_eq!(find_comment_start(".ascii \"http://x\""), None);
+        assert_eq!(find_comment_start(".ascii \"a\\\"b\" // c"), Some(14));
+        assert_eq!(find_comment_start("End"), None);
     }
 }

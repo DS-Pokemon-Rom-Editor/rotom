@@ -31,17 +31,16 @@ pub fn ensure_decomp_fixtures() {
                 "pokeplatinum" => Some(rotom::database::DatabaseV2::test_platinum()),
                 _ => None,
             };
-            let commit = match db.and_then(|db| db.meta.decomp_commit.as_deref()) {
-                Some(commit) => commit,
-                None => {
+            let commit = db
+                .and_then(|db| db.meta.decomp_commit.as_deref())
+                .unwrap_or_else(|| {
                     eprintln!(
                         "[fixtures] {} database carries no decomp provenance; \
                          falling back to pinned commit {}",
                         pin.name, pin.commit
                     );
                     pin.commit
-                }
-            };
+                });
 
             let dest = root.join("decomp").join(pin.name);
             if dest.exists() {

@@ -33,7 +33,7 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 minreq = { version = "3.0.0", features = ["https-rustls"] }
 snafu = "0.9"
 toml = "1"
-uxie = "0.9.3"
+uxie = "0.9.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 indicatif = { version = "0.18.4", features = ["rayon"] }

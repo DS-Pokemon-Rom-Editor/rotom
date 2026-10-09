@@ -293,6 +293,81 @@ pub struct Sound {
     pub used_in: Option<String>,
 }
 
+/// Derive nitrosfx-generated sound symbols from a decomp sound database.
+///
+/// `res/sound/*_sound_data.json` lists sound sequences with their file names;
+/// the decomp build turns each entry into `#define <guardified fileName>[​_<n>]
+/// <index>` (nitrosfx `-symb` output). Those names exist in neither the
+/// command database nor any committed header, so resolve them here with
+/// nitrosfx's own rule.
+///
+/// Temporary compatibility until the decomp settles its sound naming (tbd in
+/// pret): projects without that file (HGSS, DSPRE) are unaffected.
+fn load_nitrosfx_sound_symbols(root: &Path, symbols: &mut SymbolTable) -> usize {
+    let Ok(dir) = fs::read_dir(root.join("res/sound")) else {
+        return 0;
+    };
+    let mut added = 0;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let is_sound_db = path.extension().is_some_and(|ext| ext == "json")
+            && path
+                .file_stem()
+                .is_some_and(|stem| stem.to_string_lossy().ends_with("_sound_data"));
+        if !is_sound_db {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(seq_info) = doc.get("seqInfo").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for (name, id) in nitrosfx_sound_symbols(seq_info) {
+            symbols.insert_define(name, id);
+            added += 1;
+        }
+    }
+    added
+}
+
+/// Map `seqInfo` entries to `(symbol, sound id)` with nitrosfx's FNAME rule:
+/// the guardified file name, suffixed with `_<n>` for the (n+1)-th entry
+/// sharing it, valued at the entry index.
+fn nitrosfx_sound_symbols(seq_info: &[serde_json::Value]) -> Vec<(String, i64)> {
+    let mut repeats: HashMap<&str, usize> = HashMap::new();
+    let mut out = Vec::new();
+    for (index, entry) in seq_info.iter().enumerate() {
+        let Some(file_name) = entry.get("fileName").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if file_name.is_empty() {
+            continue;
+        }
+        let repeat = repeats.entry(file_name).or_insert(0);
+        let mut symbol: String = file_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if *repeat > 0 {
+            symbol.push('_');
+            symbol.push_str(&repeat.to_string());
+        }
+        *repeat += 1;
+        out.push((symbol, index as i64));
+    }
+    out
+}
+
 impl DatabaseV2 {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, CompileError> {
         let path = path.as_ref();
@@ -813,6 +888,8 @@ impl ConstantDb {
         mut symbols: SymbolTable,
     ) -> usize {
         symbols.add_dspre_aliases();
+        // Temporary compatibility, see `load_nitrosfx_sound_symbols`.
+        load_nitrosfx_sound_symbols(root.as_ref(), &mut symbols);
         let count = symbols.get_all_defines().len();
         let shared = Arc::new(symbols);
         self.uxie_project_root = Some(root.as_ref().to_path_buf());
@@ -1467,6 +1544,33 @@ mod tests {
         test_db_for_legacy_lookup_with_version("test")
     }
 
+    /// nitrosfx FNAME rule: guardified file name, `_<n>` for repeats, valued
+    /// at the seqInfo index. Mirrors the `SE_CONFIRM_sseq_3` case (4th
+    /// `SE_CONFIRM.sseq` entry = sound id 1500 in pokeplatinum).
+    #[test]
+    fn nitrosfx_sound_symbols_follow_fname_rule() {
+        let seq_info = serde_json::json!([
+            {"name": "SEQ_A", "fileName": "SE_ONE.sseq"},
+            {"name": ""},
+            {"name": "SEQ_B", "fileName": "SE_ONE.sseq"},
+            {"name": "SEQ_C", "fileName": "SE-TWO.sseq"},
+            {"name": "SEQ_D", "fileName": "SE_ONE.sseq"},
+            {"name": "SEQ_E", "fileName": "SE_ONE.sseq"},
+        ]);
+        let seq_info = seq_info.as_array().unwrap();
+
+        assert_eq!(
+            nitrosfx_sound_symbols(seq_info),
+            vec![
+                ("SE_ONE_sseq".to_string(), 0),
+                ("SE_ONE_sseq_1".to_string(), 2),
+                ("SE_TWO_sseq".to_string(), 3),
+                ("SE_ONE_sseq_2".to_string(), 4),
+                ("SE_ONE_sseq_3".to_string(), 5),
+            ]
+        );
+    }
+
     /// Decomp provenance field names must match what `sync_from_decomp.py`
     /// writes, otherwise fixture consistency checks silently see nothing.
     #[test]
@@ -1489,9 +1593,8 @@ mod tests {
 
     #[test]
     fn test_meta_tolerates_missing_decomp_provenance() {
-        let meta: DatabaseMeta =
-            serde_json::from_str(r#"{"version": "HeartGold/SoulSilver"}"#)
-                .expect("meta should deserialize");
+        let meta: DatabaseMeta = serde_json::from_str(r#"{"version": "HeartGold/SoulSilver"}"#)
+            .expect("meta should deserialize");
 
         assert_eq!(meta.decomp_repo, None);
         assert_eq!(meta.decomp_commit, None);
