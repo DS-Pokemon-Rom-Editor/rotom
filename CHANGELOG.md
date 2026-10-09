@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/KalaayPT/rotom/compare/v0.6.0...v0.7.0) - 2026-10-09
+
+### Added
+
+- *(decompiler)* added literal param option for e.g. SetVar, closes #10
+- *(cli)* decompile --file decompiles only the named binaries in project mode
+
+### Fixed
+
+- *(decomp)* various decomp fixes
+- *(compiler)* unknown commands fail analysis with their position instead of panicking in lowering
+- *(fixtures)* tie integration tests to srccmd db revision
+- *(decompiler)* keep unreferenced code that sits before a movement list in a gap
+- *(project)* decompile skips empty script binaries instead of failing on them
+- *(config)* read backslash paths from a Windows rotom.toml on every platform, and write forward slashes
+- *(cli)* print project errors on stderr with compile --json
+- *(decompiler)* number actions in offset order so every run decompiles the same
+
+### Other
+
+- Fix syntax in Test #1 script by moving 'oops'
+- shorten agents.md
+- fix test broken by upstream rename
+- *(project)* keep the first paragraph of decompile_project_files short
+- small clippy cleanup + docs
+
 ## [0.6.0](https://github.com/KalaayPT/rotom/compare/v0.5.0...v0.6.0) - 2026-08-02
 
 ### Added
