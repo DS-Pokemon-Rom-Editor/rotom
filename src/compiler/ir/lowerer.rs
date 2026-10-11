@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::ProjectContext;
-use crate::autovar::{VAR_RESULT, autovar_param_index};
+use crate::autovar::{VAR_RESULT, autovar_call_parts, autovar_param_index};
 use crate::compiler::analysis::{SymbolTable, SymbolType};
 use crate::compiler::ast::{
     Expression, ExpressionKind, MatchCase, MenuConfig, MenuEntry, ScriptFile, Statement,
@@ -701,6 +701,11 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Lower a command, emitting any autovar argument before its consumer.
+    ///
+    /// Inline actions become labels; autovar calls become `VAR_RESULT`.
+    /// Macros preserve calls until their concrete commands are lowered.
+    /// Multiple autovar arguments are rejected because they share that variable.
     fn lower_command(
         &mut self,
         command: &str,
@@ -708,10 +713,23 @@ impl<'a> Lowerer<'a> {
         macro_depth: usize,
         source_span: &std::ops::Range<usize>,
     ) -> ParseResult<()> {
-        let inline_args = if args
+        if args
             .iter()
-            .any(|arg| matches!(arg.node, ExpressionKind::InlineAction { .. }))
+            .filter(|arg| autovar_call_parts(arg, self.db).is_some())
+            .count()
+            > 1
         {
+            return Err(lowering_error_at(
+                source_span.clone(),
+                "Multiple autovar calls in one command would overwrite VAR_RESULT".to_string(),
+            ));
+        }
+
+        let cmd = self.db.get_command(command)?;
+        let lowered_args = if args.iter().any(|arg| {
+            matches!(arg.node, ExpressionKind::InlineAction { .. })
+                || (!cmd.is_macro() && autovar_call_parts(arg, self.db).is_some())
+        }) {
             let mut rewritten = Vec::with_capacity(args.len());
             for arg in args {
                 if let ExpressionKind::InlineAction { body } = &arg.node {
@@ -739,6 +757,13 @@ impl<'a> Lowerer<'a> {
                         node: ExpressionKind::Label(name),
                         span: arg.span.clone(),
                     });
+                } else if !cmd.is_macro()
+                    && let Some(var_result) = self.lower_operand_if_call(arg)?
+                {
+                    rewritten.push(Expression {
+                        node: ExpressionKind::Number(var_result),
+                        span: arg.span.clone(),
+                    });
                 } else {
                     rewritten.push(arg.clone());
                 }
@@ -747,27 +772,19 @@ impl<'a> Lowerer<'a> {
         } else {
             None
         };
-        let args = inline_args.as_deref().unwrap_or(args);
+        let args = lowered_args.as_deref().unwrap_or(args);
 
-        if let Ok(cmd) = self.db.get_command(command) {
-            if cmd.is_macro() {
-                return self.expand_macro(command, args, macro_depth, source_span);
-            }
-
-            let materialized_args = self.materialize_command_args(command, cmd, args)?;
-            let resolved_args =
-                self.resolve_args_for_command(command, &cmd.params, &materialized_args)?;
-            self.output.push(IrOpcode::Command {
-                name: command.to_string(),
-                args: resolved_args,
-            });
-        } else {
-            unreachable!(
-                "command '{}' reached lowering without a database entry; \
-                 this shouldve been caught by analysis.",
-                command
-            );
+        if cmd.is_macro() {
+            return self.expand_macro(command, args, macro_depth, source_span);
         }
+
+        let materialized_args = self.materialize_command_args(command, cmd, args)?;
+        let resolved_args =
+            self.resolve_args_for_command(command, &cmd.params, &materialized_args)?;
+        self.output.push(IrOpcode::Command {
+            name: command.to_string(),
+            args: resolved_args,
+        });
         Ok(())
     }
 
@@ -986,6 +1003,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Evaluate a database macro condition against this call's arguments.
+    ///
+    /// Direct autovar calls count as `VAR_RESULT` without being emitted here.
     fn evaluate_condition_with_arg_count(
         &self,
         condition: &str,
@@ -996,7 +1015,13 @@ impl<'a> Lowerer<'a> {
             condition,
             args,
             params,
-            |expr| self.resolve_arg_to_int(expr).ok(),
+            |expr| {
+                if autovar_call_parts(expr, self.db).is_some() {
+                    Some(VAR_RESULT)
+                } else {
+                    self.resolve_arg_to_int(expr).ok()
+                }
+            },
             |name| {
                 if let Some(cond) = ComparisonOperator::parse(name) {
                     return Some(i64::from(cond as i32));
@@ -1122,6 +1147,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Get the command name and arguments from a call like `GetPlayerStarterSpecies()`.
+    ///
+    /// Returns `None` if it is not a call to a known command.
+    /// Does not check whether the command supports autovar or generate any commands.
     fn command_call_parts<'b>(
         &self,
         expr: &'b Expression,
@@ -1229,7 +1258,7 @@ impl<'a> Lowerer<'a> {
             return self.lower_condition_inner(id, target_label, !invert);
         }
 
-        if let Some((function, args)) = self.command_call_parts(expr) {
+        if let Some((function, args)) = autovar_call_parts(expr, self.db) {
             self.lower_autovar_call(function, args, &expr.span)?;
             self.output.push(IrOpcode::Command {
                 name: "CompareVarValue".to_string(),
@@ -1295,6 +1324,16 @@ impl<'a> Lowerer<'a> {
             right,
         } = &expr.node
         {
+            if autovar_call_parts(left, self.db).is_some()
+                && autovar_call_parts(right, self.db).is_some()
+            {
+                return Err(lowering_error_at(
+                    expr.span.clone(),
+                    "Multiple autovar calls in one comparison would overwrite VAR_RESULT"
+                        .to_string(),
+                ));
+            }
+
             let left_type = self.lower_operand_if_call(left)?;
             let right_type = self.lower_operand_if_call(right)?;
 
@@ -1369,8 +1408,9 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Run a default autovar call and return its result variable, or `None` for other expressions.
     fn lower_operand_if_call(&mut self, expr: &Expression) -> ParseResult<Option<i32>> {
-        if let Some((function, args)) = self.command_call_parts(expr) {
+        if let Some((function, args)) = autovar_call_parts(expr, self.db) {
             self.lower_autovar_call(function, args, &expr.span)?;
             Ok(Some(VAR_RESULT))
         } else {
@@ -3329,6 +3369,143 @@ script TestFunc #1:
             format!("{:?}", err).contains("break statement can only be used inside a while loop"),
             "Error should mention break outside loop"
         );
+    }
+
+    #[test]
+    fn test_lower_autovar_command_argument() {
+        for (command, consumer, consumer_args) in [
+            (
+                "PlayCry GetPlayerStarterSpecies()",
+                "PlayCry",
+                vec![Arg::Value(VAR_RESULT), Arg::Value(0)],
+            ),
+            (
+                "PlayCry(GetPlayerStarterSpecies())",
+                "PlayCry",
+                vec![Arg::Value(VAR_RESULT), Arg::Value(0)],
+            ),
+            (
+                "PlayCry GetPlayerStarterSpecies(), 0",
+                "PlayCry",
+                vec![Arg::Value(VAR_RESULT), Arg::Value(0)],
+            ),
+            (
+                "PlayCry 0, GetPlayerStarterSpecies()",
+                "PlayCry",
+                vec![Arg::Value(0), Arg::Value(VAR_RESULT)],
+            ),
+            (
+                "SetVar 0x8000, GetPlayerStarterSpecies()",
+                "SetVarFromVar",
+                vec![Arg::Value(0x8000), Arg::Value(VAR_RESULT)],
+            ),
+        ] {
+            // Range constants normally come from the project's decomp headers.
+            let source = format!(
+                "alias 0x4120 as VARS_END\n\
+                 alias 0x8000 as SCRIPT_LOCAL_VARS_START\n\
+                 alias 0x800D as SCRIPT_LOCAL_VARS_END\n\
+                 script TestFunc #1:\n    {command}\n    End\n"
+            );
+            let (script_file, symbols) = parse_and_analyze(&source);
+            let db = create_test_db();
+            let mut constants = ConstantDb::new();
+            constants.load_from_db(db);
+            let mut lowerer = Lowerer::with_constants(&symbols, db, &constants);
+            let items = lowerer.lower_script_file(&script_file).unwrap();
+            let TopLevelItem::Function(function) = &items[0] else {
+                panic!("Expected script");
+            };
+            let instructions: Vec<_> = function
+                .instructions
+                .iter()
+                .map(|op| match op {
+                    IrOpcode::Command { name, args } => (name.as_str(), args.clone()),
+                    IrOpcode::Label(_) => panic!("Expected command"),
+                })
+                .collect();
+            assert_eq!(
+                instructions,
+                vec![
+                    ("GetPlayerStarterSpecies", vec![Arg::Value(VAR_RESULT)]),
+                    (consumer, consumer_args),
+                    ("End", vec![]),
+                ],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_autovar_argument_after_macro_result_write() {
+        let mut db = DatabaseV2::load(DatabaseV2::test_platinum_path()).unwrap();
+        // A test-only macro that overwrites VAR_RESULT before consuming its argument.
+        db.commands.insert(
+            "TestCry".to_string(),
+            Command {
+                cmd_type: CommandType::Macro,
+                id: None,
+                legacy_name: None,
+                description: None,
+                params: vec![ParamDef {
+                    name: "species".to_string(),
+                    param_type: ParamType::Var,
+                    const_value: None,
+                    default: None,
+                    optional: false,
+                }],
+                variants: None,
+                expansion: Some(vec![
+                    "SetVarFromValue 0x800C, 0".to_string(),
+                    "PlayCry $species".to_string(),
+                ]),
+            },
+        );
+        let source = "script TestFunc #1:\n    TestCry GetPlayerStarterSpecies()\n    End\n";
+        let (script_file, symbols) = parse_and_analyze_with_db(source, &db);
+        let mut lowerer = Lowerer::new(&symbols, &db);
+        let items = lowerer.lower_script_file(&script_file).unwrap();
+        let TopLevelItem::Function(function) = &items[0] else {
+            panic!("Expected script");
+        };
+        let instructions: Vec<_> = function
+            .instructions
+            .iter()
+            .map(|op| match op {
+                IrOpcode::Command { name, args } => (name.as_str(), args.clone()),
+                IrOpcode::Label(_) => panic!("Expected command"),
+            })
+            .collect();
+        assert_eq!(
+            instructions,
+            vec![
+                (
+                    "SetVarFromValue",
+                    vec![Arg::Value(VAR_RESULT), Arg::Value(0)]
+                ),
+                ("GetPlayerStarterSpecies", vec![Arg::Value(VAR_RESULT)]),
+                ("PlayCry", vec![Arg::Value(VAR_RESULT), Arg::Value(0)]),
+                ("End", vec![]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_lower_multiple_autovar_calls_rejected() {
+        for statement in [
+            "PlayCry GetPlayerStarterSpecies(), GetPlayerStarterSpecies()",
+            "if GetPlayerStarterSpecies() == GetPlayerStarterSpecies() then\n    endif",
+        ] {
+            let source = format!("script TestFunc #1:\n    {statement}\n    End\n");
+            let (script_file, symbols) = parse_and_analyze(&source);
+            let db = create_test_db();
+            let mut lowerer = Lowerer::new(&symbols, db);
+            let error = lowerer.lower_script_file(&script_file).unwrap_err();
+            assert!(
+                error.to_string().contains("would overwrite VAR_RESULT"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

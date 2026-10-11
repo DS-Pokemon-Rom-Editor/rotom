@@ -1,4 +1,5 @@
-use crate::database::{Command, ParamDef};
+use crate::compiler::ast::{Expression, ExpressionKind};
+use crate::database::{Command, DatabaseV2, ParamDef};
 
 pub const VAR_RESULT: i32 = 0x800C;
 
@@ -19,9 +20,29 @@ pub fn autovar_param_index(cmd: &Command) -> Option<usize> {
     cmd.params.iter().position(is_autovar_param)
 }
 
+/// Get the command and arguments from a call that uses the default autovar variable.
+///
+/// Returns `None` for other expressions, commands without autovar, or calls that
+/// supply their own result variable. Does not run the command or check its input arguments.
+pub fn autovar_call_parts<'a>(
+    expr: &'a Expression,
+    db: &DatabaseV2,
+) -> Option<(&'a Expression, &'a [Expression])> {
+    let ExpressionKind::Call { function, args } = &expr.node else {
+        return None;
+    };
+    let ExpressionKind::Identifier(name) = &function.node else {
+        return None;
+    };
+    let result_index = autovar_param_index(db.get_command(name).ok()?)?;
+    (args.len() <= result_index).then_some((function.as_ref(), args.as_slice()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::ast::Precedence;
+    use crate::compiler::{Lexer, Parser};
     use crate::database::{CommandType, ParamType, Variant};
 
     fn make_param(name: &str, default: Option<&str>) -> ParamDef {
@@ -68,5 +89,27 @@ mod tests {
             make_param("destVarID", Some("VAR_RESULT")),
         ]);
         assert_eq!(autovar_param_index(&cmd), Some(2));
+    }
+
+    #[test]
+    fn test_autovar_call_parts_only_accepts_default_autovar_calls() {
+        let db = DatabaseV2::test_platinum();
+        for (source, expected) in [
+            ("GetPlayerStarterSpecies()", true),
+            ("GetPlayerStarterSpecies(0x8000)", false),
+            ("PlayCry(0)", false),
+            ("UnknownCommand()", false),
+            ("GetPlayerStarterSpecies", false),
+            ("GetPlayerStarterSpecies() + 1", false),
+            ("(1)()", false),
+        ] {
+            let mut parser = Parser::new(Lexer::new(source));
+            let expr = parser.parse_expression(Precedence::Lowest).unwrap();
+            assert_eq!(
+                autovar_call_parts(&expr, db).is_some(),
+                expected,
+                "{source}"
+            );
+        }
     }
 }

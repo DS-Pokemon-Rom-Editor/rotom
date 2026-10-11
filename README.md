@@ -67,7 +67,6 @@ Rotom provides a complete compiler toolchain for the Gen 4 Pokémon scripting en
 
 ## To Do
 - Vendor JSON DBs for CI purposes
-- using autovar as variable params like `PlayCry GetPlayerStarterSpecies()`
 - Format string argument support, e.g. `format("Hello, {}!", BufferPlayerName)` for easy string formatting
 - runtime arithmetic via `IncrementVar`/`DecrementVar`, like `UseVar 0x40F0+312`. needs liveness analysis but could be implemented with before-and-after increment/decrement
 - Load `scripts.order` in DSPRE if present to allow for semantic file naming
@@ -248,6 +247,10 @@ script ChooseItem #1:
 ```
 
 ### Autovar: Commands in Conditions
+
+Autovar calls also work as command arguments: `PlayCry GetPlayerStarterSpecies()`
+emits `GetPlayerStarterSpecies VAR_RESULT` followed by `PlayCry VAR_RESULT`.
+Only one autovar call can be used in a command or comparison, because calls share `VAR_RESULT`.
 
 Commands that return a result (those with a `destVar`/`destVarID` parameter defaulting to `VAR_RESULT`) can be used directly in conditions. The compiler automatically:
 1. Emits the command with `VAR_RESULT` as the destination

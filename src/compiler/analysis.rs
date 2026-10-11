@@ -870,6 +870,8 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Evaluate a database variant condition against this call's arguments.
+    ///
+    /// Direct autovar calls count as `VAR_RESULT` for variant selection.
     fn evaluate_variant_condition_with_arg_count(
         &self,
         condition: &str,
@@ -880,7 +882,17 @@ impl<'a> Analyzer<'a> {
             condition,
             args,
             params,
-            |expr| self.resolve_expression_to_int(expr).ok(),
+            |expr| {
+                if self
+                    .database
+                    .and_then(|db| crate::autovar::autovar_call_parts(expr, db))
+                    .is_some()
+                {
+                    Some(crate::autovar::VAR_RESULT)
+                } else {
+                    self.resolve_expression_to_int(expr).ok()
+                }
+            },
             |name| match self.resolve_symbol(name) {
                 Some(SymbolType::Constant(val) | SymbolType::Variable(val)) => Some(i64::from(val)),
                 _ => None,
