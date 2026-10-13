@@ -20,22 +20,38 @@ pub fn autovar_param_index(cmd: &Command) -> Option<usize> {
     cmd.params.iter().position(is_autovar_param)
 }
 
-/// Get the command and arguments from a call that uses the default autovar variable.
+/// Returns the command, arguments, and result variable for the autovar call in `expr`.
 ///
 /// Returns `None` for other expressions, commands without autovar, or calls that
-/// supply their own result variable. Does not run the command or check its input arguments.
+/// put the result variable in their argument list. `resolve` looks up a `.into(...)`
+/// destination; without that suffix, the call uses `VAR_RESULT`.
+/// Uses `db` to find eligible commands. Does not run commands.
 pub fn autovar_call_parts<'a>(
     expr: &'a Expression,
     db: &DatabaseV2,
-) -> Option<(&'a Expression, &'a [Expression])> {
-    let ExpressionKind::Call { function, args } = &expr.node else {
+    resolve: impl Fn(&Expression) -> Option<i32>,
+) -> Option<(&'a Expression, &'a [Expression], i32)> {
+    let ExpressionKind::Call {
+        function,
+        args,
+        destination,
+    } = &expr.node
+    else {
         return None;
     };
     let ExpressionKind::Identifier(name) = &function.node else {
         return None;
     };
     let result_index = autovar_param_index(db.get_command(name).ok()?)?;
-    (args.len() <= result_index).then_some((function.as_ref(), args.as_slice()))
+    let result_var = match destination {
+        Some(variable) => resolve(variable)?,
+        None => VAR_RESULT,
+    };
+    (args.len() <= result_index && (0x4000..=0xffff).contains(&result_var)).then_some((
+        function.as_ref(),
+        args.as_slice(),
+        result_var,
+    ))
 }
 
 #[cfg(test)]
@@ -91,6 +107,7 @@ mod tests {
         assert_eq!(autovar_param_index(&cmd), Some(2));
     }
 
+    /// Checks that only default autovar calls are accepted.
     #[test]
     fn test_autovar_call_parts_only_accepts_default_autovar_calls() {
         let db = DatabaseV2::test_platinum();
@@ -106,10 +123,38 @@ mod tests {
             let mut parser = Parser::new(Lexer::new(source));
             let expr = parser.parse_expression(Precedence::Lowest).unwrap();
             assert_eq!(
-                autovar_call_parts(&expr, db).is_some(),
+                autovar_call_parts(&expr, db, |_| None).is_some(),
                 expected,
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn test_autovar_call_parts_selects_result_variable() {
+        for (source, expected) in [
+            ("GetPlayerStarterSpecies()", Some(VAR_RESULT)),
+            ("GetPlayerStarterSpecies().into(0x8004)", Some(0x8004)),
+            ("GetPlayerStarterSpecies().into(RESULT)", Some(0x8005)),
+            ("GetPlayerStarterSpecies().into(MISSING)", None),
+            ("GetPlayerStarterSpecies().into(1)", None),
+            ("GetPlayerStarterSpecies().into(0x10000)", None),
+            ("GetPlayerStarterSpecies(0x8004).into(0x8005)", None),
+            ("PlayCry(0).into(0x8004)", None),
+        ] {
+            let mut parser = Parser::new(Lexer::new(source));
+            let expr = parser.parse_expression(Precedence::Lowest).unwrap();
+            let parts =
+                autovar_call_parts(
+                    &expr,
+                    DatabaseV2::test_platinum(),
+                    |variable| match &variable.node {
+                        ExpressionKind::Number(value) => Some(*value),
+                        ExpressionKind::Identifier(name) if name == "RESULT" => Some(0x8005),
+                        _ => None,
+                    },
+                );
+            assert_eq!(parts.map(|(_, _, variable)| variable), expected, "{source}");
         }
     }
 }

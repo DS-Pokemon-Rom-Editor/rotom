@@ -909,6 +909,10 @@ impl<'a> Parser<'a> {
             span: start..end,
         })
     }
+    /// Parses an expression using the operator order set by `precedence`.
+    ///
+    /// Returns the expression or an error and advances the parser past the parsed tokens.
+    /// Includes command calls and `.into(variable)` suffixes.
     pub fn parse_expression(&mut self, precedence: Precedence) -> ParseResult<Expression> {
         let mut left = self.parse_prefix()?;
         while !self.current_token_is(&TokenType::EOF)
@@ -1049,9 +1053,14 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses an operator or call suffix after `left` and returns the full expression.
+    ///
+    /// Advances the parser past the operator's right side or the call suffix.
     fn parse_infix(&mut self, left: Expression) -> ParseResult<Expression> {
         let start = left.span.start;
-        if self.current_token_is(&TokenType::LParen) {
+        if self.current_token_is(&TokenType::LParen)
+            || matches!(&self.current_token.kind, TokenType::Identifier(name) if name == ".into")
+        {
             return self.parse_call_expression(left);
         }
         let operator = self.current_token.kind.clone();
@@ -1068,9 +1077,33 @@ impl<'a> Parser<'a> {
             span: start..end,
         })
     }
-    fn parse_call_expression(&mut self, function: Expression) -> ParseResult<Expression> {
+    /// Parses `(arguments)` or `.into(variable)` after `function`.
+    ///
+    /// Returns a new call or the existing call with its destination set.
+    /// Advances the parser past the closing `)`. Returns an error for invalid suffixes.
+    fn parse_call_expression(&mut self, mut function: Expression) -> ParseResult<Expression> {
         let start = function.span.start;
-        self.advance();
+        let suffix_span = self.current_token.span.clone();
+        let destination = if matches!(&self.current_token.kind, TokenType::Identifier(name) if name == ".into")
+        {
+            let ExpressionKind::Call { destination, .. } = &mut function.node else {
+                return Err(parse_error(
+                    suffix_span,
+                    ".into() must follow a command call".to_string(),
+                ));
+            };
+            if destination.is_some() {
+                return Err(parse_error(
+                    suffix_span,
+                    "A command call can only have one .into()".to_string(),
+                ));
+            }
+            self.advance();
+            Some(destination)
+        } else {
+            None
+        };
+        self.expect_advance(&TokenType::LParen)?;
         let mut args = Vec::new();
         if !self.current_token_is(&TokenType::RParen) {
             loop {
@@ -1085,14 +1118,27 @@ impl<'a> Parser<'a> {
         }
         self.expect_advance(&TokenType::RParen)?;
         let end = self.current_token.span.start;
+        if let Some(destination) = destination {
+            if args.len() != 1 {
+                return Err(parse_error(
+                    suffix_span,
+                    ".into() requires exactly one variable".to_string(),
+                ));
+            }
+            *destination = Some(Box::new(args.pop().unwrap()));
+            function.span.end = end;
+            return Ok(function);
+        }
         Ok(Spanned {
             node: ExpressionKind::Call {
                 function: Box::new(function),
                 args,
+                destination: None,
             },
             span: start..end,
         })
     }
+    /// Returns the binding order for the operator or call suffix in `kind`.
     fn get_precedence(kind: &TokenType) -> Precedence {
         match kind {
             TokenType::Or => Precedence::LogicalOr,
@@ -1111,6 +1157,7 @@ impl<'a> Parser<'a> {
             TokenType::Mul => Precedence::Product,
 
             TokenType::LParen => Precedence::Call,
+            TokenType::Identifier(name) if name == ".into" => Precedence::Call,
 
             _ => Precedence::Lowest,
         }
@@ -1853,6 +1900,47 @@ script Second #2:
         let errors = std::mem::take(&mut parser.errors);
         assert!(errors.is_empty());
         assert!(file.items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_autovar_into_suffix() {
+        let source = "GetPlayerStarterSpecies().into(0x8004)";
+        let mut parser = Parser::new(Lexer::new(source));
+        let expr = parser.parse_expression(Precedence::Lowest).unwrap();
+        let ExpressionKind::Call {
+            args, destination, ..
+        } = &expr.node
+        else {
+            panic!("Expected call");
+        };
+        assert!(args.is_empty());
+        assert!(matches!(
+            destination.as_ref().unwrap().node,
+            ExpressionKind::Number(0x8004)
+        ));
+        assert_eq!(expr.span, 0..source.len());
+        assert_eq!(
+            expr.to_macro_arg_source().unwrap(),
+            source.replace("0x8004", "32772")
+        );
+        assert!(expr.to_constant_eval_source().is_err());
+    }
+
+    #[test]
+    fn test_parse_autovar_into_rejects_malformed_suffixes() {
+        for source in [
+            "1.into(0x8004)",
+            "GetPlayerStarterSpecies().into()",
+            "GetPlayerStarterSpecies().into(0x8004, 0x8005)",
+            "GetPlayerStarterSpecies().into(0x8004).into(0x8005)",
+            "GetPlayerStarterSpecies().into(0x8004",
+        ] {
+            let mut parser = Parser::new(Lexer::new(source));
+            assert!(
+                parser.parse_expression(Precedence::Lowest).is_err(),
+                "{source}"
+            );
+        }
     }
 
     #[test]

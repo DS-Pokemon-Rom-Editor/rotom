@@ -250,7 +250,11 @@ script ChooseItem #1:
 
 Autovar calls also work as command arguments: `PlayCry GetPlayerStarterSpecies()`
 emits `GetPlayerStarterSpecies VAR_RESULT` followed by `PlayCry VAR_RESULT`.
-Only one autovar call can be used in a command or comparison, because calls share `VAR_RESULT`.
+The `.into(variable)` suffix selects a different result variable and accepts variable aliases:
+`PlayCry GetPlayerStarterSpecies().into(0x8004)` writes and reads `0x8004` instead.
+Calls in the same command or comparison must use different result variables, or compilation
+fails because one call would overwrite the other's result. Without `.into(...)`, calls
+still use `VAR_RESULT`. This also works in conditions and match subjects.
 
 Commands that return a result (those with a `destVar`/`destVarID` parameter defaulting to `VAR_RESULT`) can be used directly in conditions. The compiler automatically:
 1. Emits the command with `VAR_RESULT` as the destination

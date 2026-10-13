@@ -354,7 +354,9 @@ fn count_label_ref(
     }
 }
 
-/// Count alias references in an expression, including inline movement bodies.
+/// Counts references to names in `aliases` within `expr` and adds their locations to `refs`.
+///
+/// Uses `uri` and `map` for source locations. Includes inline movement bodies.
 fn count_alias_refs_in_expr(
     expr: &rotom::compiler::ast::Expression,
     uri: &Url,
@@ -375,10 +377,17 @@ fn count_alias_refs_in_expr(
             count_alias_refs_in_expr(left, uri, map, refs, aliases);
             count_alias_refs_in_expr(right, uri, map, refs, aliases);
         }
-        ExpressionKind::Call { function, args } => {
+        ExpressionKind::Call {
+            function,
+            args,
+            destination,
+        } => {
             count_alias_refs_in_expr(function, uri, map, refs, aliases);
             for arg in args {
                 count_alias_refs_in_expr(arg, uri, map, refs, aliases);
+            }
+            if let Some(destination) = destination {
+                count_alias_refs_in_expr(destination, uri, map, refs, aliases);
             }
         }
         ExpressionKind::InlineAction { body } => {
@@ -543,6 +552,26 @@ mod tests {
             .and_then(|lens| lens.command.as_ref())
             .expect("alias lens");
         assert_eq!(alias_lens.title, "2 references");
+    }
+
+    #[test]
+    fn script_code_lens_counts_alias_references_in_call_destinations() {
+        let uri = Url::from_file_path("/tmp/test.rotom").expect("uri");
+        let source = "script Main #1:\n    alias 0x8001 as VAR_RESULT\n    alias Lookup(1).into(VAR_RESULT) as RESULT\n    End\n";
+        let lenses = compute_script_code_lens(source, &uri, None, None);
+        let alias_lens = lenses
+            .iter()
+            .find(|lens| lens.range.start.line == 1)
+            .and_then(|lens| lens.command.as_ref())
+            .expect("alias lens");
+        assert_eq!(alias_lens.title, "1 reference");
+        let locations: Vec<tower_lsp::lsp_types::Location> =
+            serde_json::from_value(alias_lens.arguments.as_ref().expect("arguments")[2].clone())
+                .expect("reference locations");
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].range.start.line, 2);
+        assert_eq!(locations[0].range.start.character, 25);
+        assert_eq!(locations[0].range.end.character, 35);
     }
 
     #[test]

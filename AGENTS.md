@@ -87,6 +87,7 @@ The test: Every changed line should trace directly to the user's request.
 
 - Keep docs concise and in simple, easy to understand language.
 - Always document inputs and outputs of a function, and any side effects.
+- Write all Documentation in ASD-STE100 Simplified Technical English
 - Otherwise, adhere to Rust RFC 1574
 
 ---

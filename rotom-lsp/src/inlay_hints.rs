@@ -118,7 +118,9 @@ fn walk_statement(
     }
 }
 
-/// Walk nested expressions and movement statements for parameter hints.
+/// Visits `expr` and adds hints from nested movement statements to `hints`.
+///
+/// Uses `db` for parameter names and `map` for source positions.
 #[allow(clippy::only_used_in_recursion)]
 fn walk_expression(
     expr: &rotom::compiler::ast::Expression,
@@ -134,10 +136,17 @@ fn walk_expression(
             walk_expression(left, db, map, hints);
             walk_expression(right, db, map, hints);
         }
-        rotom::compiler::ast::ExpressionKind::Call { function, args } => {
+        rotom::compiler::ast::ExpressionKind::Call {
+            function,
+            args,
+            destination,
+        } => {
             walk_expression(function, db, map, hints);
             for arg in args {
                 walk_expression(arg, db, map, hints);
+            }
+            if let Some(destination) = destination {
+                walk_expression(destination, db, map, hints);
             }
         }
         rotom::compiler::ast::ExpressionKind::InlineAction { body } => {

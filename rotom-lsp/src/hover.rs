@@ -14,7 +14,10 @@ use rotom::database::{Command, ConstantDb, DatabaseV2};
 use crate::message_refs::{find_command_at_offset, is_text_slot, resolve_archive_id};
 use crate::util::parse_source;
 
-/// Produce an LSP hover response for the symbol under the cursor.
+/// Produces an LSP hover response for the symbol at `position` in `source`.
+///
+/// Uses `project` and `source_path` for context when provided.
+/// Returns `None` if no hover information is available.
 pub fn compute_hover(
     source: &str,
     position: LspPosition,
@@ -191,10 +194,7 @@ pub fn compute_hover(
             } => {
                 format!("{} {operator:?} {}", format_expr(left), format_expr(right))
             }
-            ExpressionKind::Call { function, args } => {
-                let arg_strs: Vec<String> = args.iter().map(format_expr).collect();
-                format!("{}({})", format_expr(function), arg_strs.join(", "))
-            }
+            ExpressionKind::Call { .. } => format_expr(&alias_value),
             ExpressionKind::InlineAction { .. } => "action(...)".to_string(),
             ExpressionKind::Error => "<error>".to_string(),
         };
@@ -358,7 +358,7 @@ fn resolve_message_text(
     workspace.read_message(archive_id, msg_index as u16)
 }
 
-/// Format an expression for hover text.
+/// Returns `expr` as hover text. Does not change the expression.
 fn format_expr(expr: &rotom::compiler::ast::Expression) -> String {
     match &expr.node {
         ExpressionKind::Number(n) => n.to_string(),
@@ -378,9 +378,17 @@ fn format_expr(expr: &rotom::compiler::ast::Expression) -> String {
         } => {
             format!("{} {operator:?} {}", format_expr(left), format_expr(right))
         }
-        ExpressionKind::Call { function, args } => {
+        ExpressionKind::Call {
+            function,
+            args,
+            destination,
+        } => {
             let arg_strs: Vec<String> = args.iter().map(format_expr).collect();
-            format!("{}({})", format_expr(function), arg_strs.join(", "))
+            let mut call = format!("{}({})", format_expr(function), arg_strs.join(", "));
+            if let Some(destination) = destination {
+                write!(call, ".into({})", format_expr(destination)).unwrap();
+            }
+            call
         }
         ExpressionKind::InlineAction { .. } => "action(...)".to_string(),
         ExpressionKind::Error => "<error>".to_string(),
@@ -615,6 +623,23 @@ mod tests {
         match hover.contents {
             HoverContents::Markup(markup) => markup.value,
             other => panic!("expected markup hover, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_call_preserves_optional_destination() {
+        for (expression, expected) in [
+            ("Lookup(1)", "Lookup(1)"),
+            ("Lookup(1).into(VAR_RESULT)", "Lookup(1).into(VAR_RESULT)"),
+            (
+                "Lookup(Nested(2).into(VAR_INNER)).into(VAR_RESULT)",
+                "Lookup(Nested(2).into(VAR_INNER)).into(VAR_RESULT)",
+            ),
+        ] {
+            let source = format!("alias {expression} as RESULT\n");
+            let ast = parse_source(&source).expect("parse call alias");
+            let (value, _) = find_alias_in_items(&ast.items, "RESULT").expect("call alias");
+            assert_eq!(format_expr(&value), expected);
         }
     }
 

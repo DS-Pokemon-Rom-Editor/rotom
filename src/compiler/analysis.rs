@@ -384,7 +384,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// Record aliases referenced anywhere inside an expression.
+    /// Records aliases used in `expr` as referenced, including in nested expressions.
     fn collect_alias_references_in_expression(&mut self, expr: &Expression) {
         match &expr.node {
             ExpressionKind::Identifier(name) | ExpressionKind::Label(name) => {
@@ -399,10 +399,17 @@ impl<'a> Analyzer<'a> {
                 self.collect_alias_references_in_expression(left);
                 self.collect_alias_references_in_expression(right);
             }
-            ExpressionKind::Call { function, args } => {
+            ExpressionKind::Call {
+                function,
+                args,
+                destination,
+            } => {
                 self.collect_alias_references_in_expression(function);
                 for arg in args {
                     self.collect_alias_references_in_expression(arg);
+                }
+                if let Some(destination) = destination {
+                    self.collect_alias_references_in_expression(destination);
                 }
             }
             ExpressionKind::InlineAction { body } => {
@@ -701,17 +708,23 @@ impl<'a> Analyzer<'a> {
         crate::autovar::autovar_param_index(cmd)
     }
 
-    /// Validate that a Call expression is to an autovar-compatible command
-    fn validate_autovar_call(
-        &mut self,
-        function: &Expression,
-        args: &[Expression],
-        span: &Range<usize>,
-    ) -> ParseResult<()> {
+    /// Checks that the call in `expr` supports autovar and has a valid destination.
+    ///
+    /// Returns an error if validation fails and records warnings for input arguments.
+    fn validate_autovar_call(&mut self, expr: &Expression) -> ParseResult<()> {
+        let ExpressionKind::Call {
+            function,
+            args,
+            destination,
+        } = &expr.node
+        else {
+            unreachable!("autovar validation requires a call expression");
+        };
+        let span = &expr.span;
         let ExpressionKind::Identifier(name) = &function.node else {
             return Err(analysis_error(
                 span.clone(),
-                "Command calls in conditions must use a command name".to_string(),
+                "Autovar calls must use a command name".to_string(),
             ));
         };
 
@@ -719,7 +732,7 @@ impl<'a> Analyzer<'a> {
             return Err(analysis_error(
                 span.clone(),
                 format!(
-                    "Command '{}' cannot be used in a condition because it does not return a result. \
+                    "Command '{}' cannot be used as a value because it does not return a result. \
                      Only commands with a destVar/destVarID parameter that defaults to VAR_RESULT can be used this way.",
                     name
                 ),
@@ -740,11 +753,29 @@ impl<'a> Analyzer<'a> {
             return Err(analysis_error(
                 span.clone(),
                 format!(
-                    "When using '{}' in a condition, do not specify the result variable - it will automatically use VAR_RESULT. \
+                    "When using '{}' as a value, do not specify the result variable in its arguments; use .into(variable) to override it. \
                      Provide only the first {} argument(s).",
                     name, autovar_index
                 ),
             ));
+        }
+
+        if let Some(variable) = destination {
+            self.resolve_expression_to_int(variable)?;
+            if self
+                .database
+                .and_then(|db| {
+                    crate::autovar::autovar_call_parts(expr, db, |variable| {
+                        self.resolve_expression_to_int(variable).ok()
+                    })
+                })
+                .is_none()
+            {
+                return Err(analysis_error(
+                    variable.span.clone(),
+                    ".into() requires a variable ID from 0x4000 to 0xFFFF".to_string(),
+                ));
+            }
         }
 
         for arg in args {
@@ -754,7 +785,9 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// Validate a match statement subject (must be a variable or autovar call)
+    /// Validates `subject` for a match statement and returns an error if it is not supported.
+    ///
+    /// Uses `stmt_span` for errors that need the whole statement.
     fn validate_match_subject(
         &mut self,
         subject: &Expression,
@@ -788,10 +821,7 @@ impl<'a> Analyzer<'a> {
                     ))
                 }
             }
-            ExpressionKind::Call { function, args } => {
-                self.validate_autovar_call(function, args, &subject.span)?;
-                Ok(())
-            }
+            ExpressionKind::Call { .. } => self.validate_autovar_call(subject),
             _ => Err(analysis_error(
                 stmt_span.clone(),
                 "match subject must be a variable or an autovar command call".to_string(),
@@ -869,9 +899,10 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// Evaluate a database variant condition against this call's arguments.
+    /// Evaluates `condition` using `args` and parameter names from `params`.
     ///
-    /// Direct autovar calls count as `VAR_RESULT` for variant selection.
+    /// Returns whether the variant matches, or an error.
+    /// Autovar calls count as their chosen result variable for variant selection.
     fn evaluate_variant_condition_with_arg_count(
         &self,
         condition: &str,
@@ -883,15 +914,14 @@ impl<'a> Analyzer<'a> {
             args,
             params,
             |expr| {
-                if self
-                    .database
-                    .and_then(|db| crate::autovar::autovar_call_parts(expr, db))
-                    .is_some()
-                {
-                    Some(crate::autovar::VAR_RESULT)
-                } else {
-                    self.resolve_expression_to_int(expr).ok()
-                }
+                self.database
+                    .and_then(|db| {
+                        crate::autovar::autovar_call_parts(expr, db, |variable| {
+                            self.resolve_expression_to_int(variable).ok()
+                        })
+                    })
+                    .map(|(_, _, variable)| variable)
+                    .or_else(|| self.resolve_expression_to_int(expr).ok())
             },
             |name| match self.resolve_symbol(name) {
                 Some(SymbolType::Constant(val) | SymbolType::Variable(val)) => Some(i64::from(val)),
@@ -1106,7 +1136,9 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// Validate an expression outside context-specific command argument handling.
+    /// Checks `expr` outside command-specific argument handling.
+    ///
+    /// Returns an error if the expression is invalid and records any warnings.
     pub fn validate_expression(&mut self, expr: &Expression) -> ParseResult<()> {
         match &expr.node {
             ExpressionKind::Number(_) | ExpressionKind::Label(_) | ExpressionKind::Error => {}
@@ -1132,10 +1164,13 @@ impl<'a> Analyzer<'a> {
             ExpressionKind::Prefix { id, .. } => {
                 self.validate_expression(id)?;
             }
-            ExpressionKind::Call { function, args }
-                if matches!(&function.node, ExpressionKind::Identifier(n) if n == "format")
-                    && args.len() == 1
-                    && matches!(&args[0].node, ExpressionKind::String(_)) =>
+            ExpressionKind::Call {
+                function,
+                args,
+                destination: None,
+            } if matches!(&function.node, ExpressionKind::Identifier(n) if n == "format")
+                && args.len() == 1
+                && matches!(&args[0].node, ExpressionKind::String(_)) =>
             {
                 let ExpressionKind::String(segs) = &args[0].node else {
                     unreachable!()
@@ -1158,9 +1193,9 @@ impl<'a> Analyzer<'a> {
                     ));
                 }
             }
-            ExpressionKind::Call { function, args } => {
-                if self.is_command_call(expr) {
-                    self.validate_autovar_call(function, args, &expr.span)?;
+            ExpressionKind::Call { destination, .. } => {
+                if destination.is_some() || self.is_command_call(expr) {
+                    self.validate_autovar_call(expr)?;
                 } else {
                     self.resolve_expression_to_int(expr).map(|_| ())?;
                 }
@@ -2885,6 +2920,48 @@ script TestFunc #1:
         );
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("do not specify the result variable"));
+    }
+
+    #[test]
+    fn test_autovar_into_rejects_invalid_destinations_and_commands() {
+        use crate::compiler::{Lexer, Parser};
+
+        let db = DatabaseV2::test_platinum();
+        let constants = ConstantDb::new();
+        for expression in [
+            "GetPlayerStarterSpecies().into(1)",
+            "GetPlayerStarterSpecies().into(0x10000)",
+            "GetPlayerStarterSpecies().into(MISSING_VARIABLE)",
+            "GetPlayerStarterSpecies().into(GetPlayerStarterSpecies())",
+            "GetPlayerStarterSpecies(0x8004).into(0x8005)",
+            "PlayCry(1).into(0x8004)",
+            "UnknownCommand().into(0x8004)",
+            "format(\"text\").into(0x8004)",
+        ] {
+            let source = format!("script Test #1:\n    PlayCry {expression}\n    End\n");
+            let mut parser = Parser::new(Lexer::new(&source));
+            let file = parser.parse_script_file().unwrap();
+            let mut analyzer = Analyzer::with_database(&constants, db);
+            assert!(analyzer.analyze(&file).is_err(), "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_autovar_into_marks_destination_alias_as_used() {
+        use crate::compiler::{Lexer, Parser};
+
+        let source = "alias 0x8004 as RESULT\nscript Test #1:\n    PlayCry GetPlayerStarterSpecies().into(RESULT)\n    End\n";
+        let mut parser = Parser::new(Lexer::new(source));
+        let file = parser.parse_script_file().unwrap();
+        let constants = ConstantDb::new();
+        let mut analyzer = Analyzer::with_database(&constants, DatabaseV2::test_platinum());
+        analyzer.analyze(&file).unwrap();
+        assert!(
+            !analyzer
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, CompileWarning::UnusedAlias { name, .. } if name == "RESULT"))
+        );
     }
 
     #[test]

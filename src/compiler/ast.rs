@@ -151,6 +151,8 @@ pub enum ExpressionKind {
     Call {
         function: Box<Expression>,
         args: Vec<Expression>,
+        /// Result variable chosen with `.into(...)`, if present.
+        destination: Option<Box<Expression>>,
     },
     /// An anonymous movement block used as a command argument.
     InlineAction {
@@ -184,17 +186,31 @@ pub type Expression = Spanned<ExpressionKind>;
 pub type Statement = Spanned<StatementKind>;
 
 impl Spanned<ExpressionKind> {
+    /// Returns this expression as text for constant evaluation, or an error.
+    ///
+    /// Puts parentheses around each binary operation and rejects `.into(...)`.
+    /// Does not change the expression.
     pub fn to_constant_eval_source(&self) -> Result<String, String> {
         self.format_source_like(true, "constant expression", "constant evaluation")
     }
 
+    /// Returns this expression as macro argument text, or an error.
+    ///
+    /// Keeps `.into(...)` if present. Does not change the expression.
     pub fn to_macro_arg_source(&self) -> Result<String, String> {
         self.format_source_like(false, "macro argument", "macro argument")
     }
 
+    /// Returns source text for this expression, or an error for an unsupported expression.
+    ///
+    /// If `for_constant_eval` is true, the function puts parentheses around each binary
+    /// operation (for example, `(1 + 2)`) and rejects `.into(...)`.
+    /// Otherwise, it writes macro argument text and keeps `.into(...)`.
+    /// `domain` and `err_domain` supply the context names for error messages.
+    /// Does not change the expression.
     fn format_source_like(
         &self,
-        parenthesize_infix: bool,
+        for_constant_eval: bool,
         domain: &str,
         err_domain: &str,
     ) -> Result<String, String> {
@@ -208,7 +224,7 @@ impl Spanned<ExpressionKind> {
                 .collect::<Vec<_>>()
                 .join(" ")),
             ExpressionKind::Prefix { operator, id } => {
-                let inner = id.format_source_like(parenthesize_infix, domain, err_domain)?;
+                let inner = id.format_source_like(for_constant_eval, domain, err_domain)?;
                 let op = match operator {
                     TokenType::Minus => "-",
                     TokenType::Plus => "+",
@@ -224,8 +240,8 @@ impl Spanned<ExpressionKind> {
                 operator,
                 right,
             } => {
-                let left_str = left.format_source_like(parenthesize_infix, domain, err_domain)?;
-                let right_str = right.format_source_like(parenthesize_infix, domain, err_domain)?;
+                let left_str = left.format_source_like(for_constant_eval, domain, err_domain)?;
+                let right_str = right.format_source_like(for_constant_eval, domain, err_domain)?;
                 let op = match operator {
                     TokenType::Plus => "+",
                     TokenType::Minus => "-",
@@ -241,13 +257,17 @@ impl Spanned<ExpressionKind> {
                     other => return Err(format!("Unsupported operator {other:?} in {domain}")),
                 };
                 let formatted = format!("{left_str} {op} {right_str}");
-                if parenthesize_infix {
+                if for_constant_eval {
                     Ok(format!("({formatted})"))
                 } else {
                     Ok(formatted)
                 }
             }
-            ExpressionKind::Call { function, args } => {
+            ExpressionKind::Call {
+                function,
+                args,
+                destination,
+            } => {
                 let ExpressionKind::Identifier(name) = &function.node else {
                     return Err(format!("Call-like {err_domain} must use a simple name"));
                 };
@@ -255,13 +275,24 @@ impl Spanned<ExpressionKind> {
                 let mut formatted_args = Vec::with_capacity(args.len());
                 for arg in args {
                     formatted_args.push(arg.format_source_like(
-                        parenthesize_infix,
+                        for_constant_eval,
                         domain,
                         err_domain,
                     )?);
                 }
 
-                Ok(format!("{}({})", name, formatted_args.join(", ")))
+                let mut call = format!("{}({})", name, formatted_args.join(", "));
+                if let Some(destination) = destination {
+                    if for_constant_eval {
+                        return Err(
+                            "Autovar calls cannot be used as constant expressions".to_string()
+                        );
+                    }
+                    call.push_str(".into(");
+                    call.push_str(&destination.to_constant_eval_source()?);
+                    call.push(')');
+                }
+                Ok(call)
             }
             ExpressionKind::InlineAction { .. } => {
                 Err(format!("Inline action cannot be used as a {err_domain}"))
@@ -311,6 +342,7 @@ mod tests {
         assert_eq!(expr.to_macro_arg_source().unwrap(), "-42");
     }
 
+    /// Checks that ordinary calls keep their format when no destination is specified.
     #[test]
     fn test_call_expression_formatting() {
         let expr = Expression {
@@ -329,6 +361,7 @@ mod tests {
                         span: 8..9,
                     },
                 ],
+                destination: None,
             },
             span: 0..10,
         };
@@ -336,6 +369,7 @@ mod tests {
         assert_eq!(expr.to_macro_arg_source().unwrap(), "TEST(1, 2)");
     }
 
+    /// Checks that calls without a command name return an error.
     #[test]
     fn test_call_non_identifier_function_contains_context() {
         let expr = Expression {
@@ -345,6 +379,7 @@ mod tests {
                     span: 0..2,
                 }),
                 args: vec![],
+                destination: None,
             },
             span: 0..2,
         };
