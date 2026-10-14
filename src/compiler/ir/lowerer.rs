@@ -710,9 +710,9 @@ impl<'a> Lowerer<'a> {
 
     /// Lowers `command` with `args` and appends its instructions to the output.
     ///
-    /// Inline actions become labels; autovar calls become their chosen result variables. Default: VAR_RESULT
+    /// Inline actions become labels; autovar calls become their chosen result variables. Default: `VAR_RESULT`
     /// Macros preserve calls until their concrete commands are lowered.
-    /// Multiple autovar arguments cannot share a result variable.
+    /// Autovar arguments in a concrete command cannot share a result variable.
     /// `macro_depth` tracks nested macro expansion; `source_span` locates errors.
     /// Returns an error if the command cannot be lowered.
     fn lower_command(
@@ -722,11 +722,15 @@ impl<'a> Lowerer<'a> {
         macro_depth: usize,
         source_span: &std::ops::Range<usize>,
     ) -> ParseResult<()> {
+        let cmd = self.db.get_command(command)?;
         let mut result_variables = HashSet::new();
         for arg in args {
-            if let Some((_, _, variable)) = autovar_call_parts(arg, self.db, |variable| {
-                self.resolve_arg_to_int(variable).ok()
-            }) && !result_variables.insert(variable)
+            // Macro arguments are checked when their concrete consumers are lowered.
+            if !cmd.is_macro()
+                && let Some((_, _, variable)) = autovar_call_parts(arg, self.db, |variable| {
+                    self.resolve_arg_to_int(variable).ok()
+                })
+                && !result_variables.insert(variable)
             {
                 return Err(lowering_error_at(
                     arg.span.clone(),
@@ -737,7 +741,6 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        let cmd = self.db.get_command(command)?;
         let lowered_args = if args.iter().any(|arg| {
             matches!(arg.node, ExpressionKind::InlineAction { .. })
                 || (!cmd.is_macro()
@@ -1463,6 +1466,7 @@ impl<'a> Lowerer<'a> {
 
     /// Emits `function` with `args` and `result_var` as its result destination.
     ///
+    /// Prepares the result argument, then uses normal command lowering.
     /// Appends instructions and uses `source_span` to locate errors.
     /// Returns an error if lowering fails.
     fn lower_autovar_call(
@@ -1511,43 +1515,19 @@ impl<'a> Lowerer<'a> {
             });
         }
 
-        let shape = self.select_command_shape(cmd, &final_args);
-        let args_with_defaults = Self::apply_defaults_to_params(name, shape.params, &final_args)?;
-
-        if cmd.is_macro() {
-            let expansion = shape.macro_expansion.ok_or_else(|| {
-                lowering_error(format!(
-                    "Macro '{}' has no expansion defined (and no matching variant)",
-                    name
-                ))
-            })?;
-
-            let mut param_map: HashMap<String, String> = HashMap::new();
-            for (param, arg) in shape.params.iter().zip(args_with_defaults.iter()) {
-                let formatted = arg.to_macro_arg_source().map_err(lowering_error)?;
-                param_map.insert(param.name.clone(), formatted);
-            }
-
-            for line in expansion {
-                let substituted = Self::substitute_params(line, &param_map);
-                let parsed_stmt = Self::parse_expansion_line(&substituted)
-                    .map_err(|error| error.with_lowering_span(source_span.clone()))?;
-                self.lower_statement_with_depth(&parsed_stmt, 1)
-                    .map_err(|error| error.with_lowering_span(source_span.clone()))?;
-            }
-        } else {
-            let resolved_args = self.resolve_args(&args_with_defaults)?;
-            self.output.push(IrOpcode::Command {
-                name: name.clone(),
-                args: resolved_args,
-            });
+        // Result-variable collision checks cover direct arguments, not nested calls.
+        if !cmd.is_macro()
+            && let Some(arg) = final_args
+                .iter()
+                .find(|arg| self.command_call_parts(arg).is_some())
+        {
+            return Err(lowering_error_at(
+                arg.span.clone(),
+                "Nested command calls in autovar inputs are not supported".to_string(),
+            ));
         }
 
-        Ok(())
-    }
-
-    fn resolve_args(&self, args: &[Expression]) -> ParseResult<Vec<Arg>> {
-        args.iter().map(|arg| self.resolve_arg(arg)).collect()
+        self.lower_command(name, &final_args, 0, source_span)
     }
 
     /// Resolve args, routing string literals for `text_slot` params into the
@@ -3411,6 +3391,163 @@ script TestFunc #1:
         assert!(
             format!("{:?}", err).contains("break statement can only be used inside a while loop"),
             "Error should mention break outside loop"
+        );
+    }
+
+    #[test]
+    fn test_lower_autovar_uses_command_emit_args() {
+        let mut db = DatabaseV2::load(DatabaseV2::test_platinum_path()).unwrap();
+        let cmd = db.commands.get_mut("GetPlayerStarterSpecies").unwrap();
+        let emit_args = vec![format!("${}", cmd.params[0].name)];
+        let mut params = cmd.params.clone();
+        // This test-only source default must not become an extra opcode argument.
+        params.push(ParamDef {
+            name: "unused".to_string(),
+            param_type: ParamType::U16,
+            const_value: None,
+            default: Some("0".to_string()),
+            optional: false,
+        });
+        cmd.variants = Some(vec![Variant {
+            params,
+            desc: None,
+            condition: Some("1 arg".to_string()),
+            expansion: None,
+            emit_args: Some(emit_args),
+        }]);
+        let source =
+            "script Test #1:\n    PlayCry GetPlayerStarterSpecies().into(0x8004)\n    End\n";
+        let (file, symbols) = parse_and_analyze_with_db(source, &db);
+        let mut lowerer = Lowerer::new(&symbols, &db);
+        let items = lowerer.lower_script_file(&file).unwrap();
+        let TopLevelItem::Function(function) = &items[0] else {
+            panic!("Expected script");
+        };
+        assert!(matches!(
+            &function.instructions[0],
+            IrOpcode::Command { name, args }
+                if name == "GetPlayerStarterSpecies" && args == &[Arg::Value(0x8004)]
+        ));
+        assert!(matches!(
+            &function.instructions[1],
+            IrOpcode::Command { name, args }
+                if name == "PlayCry" && args == &[Arg::Value(0x8004), Arg::Value(0)]
+        ));
+    }
+
+    #[test]
+    fn test_lower_autovar_macro_uses_command_expansion() {
+        for (call, variable) in [
+            ("LoadNationalDexRating()", VAR_RESULT),
+            ("LoadNationalDexRating().into(0x8004)", 0x8004),
+        ] {
+            let source = format!("script Test #1:\n    PlayCry {call}\n    End\n");
+            let (file, symbols) = parse_and_analyze(&source);
+            let db = create_test_db();
+            let mut constants = ConstantDb::new();
+            constants.load_from_db(db);
+            let mut lowerer = Lowerer::with_constants(&symbols, db, &constants);
+            let items = lowerer.lower_script_file(&file).unwrap();
+            let TopLevelItem::Function(function) = &items[0] else {
+                panic!("Expected script");
+            };
+            assert!(matches!(
+                &function.instructions[0],
+                IrOpcode::Command { name, args }
+                    if name == "LoadPokedexRating" && args == &[Arg::Value(1), Arg::Value(variable)]
+            ));
+            assert!(matches!(
+                &function.instructions[1],
+                IrOpcode::Command { name, args }
+                    if name == "PlayCry" && args == &[Arg::Value(variable), Arg::Value(0)]
+            ));
+        }
+    }
+
+    #[test]
+    fn test_macro_input_collisions_are_checked_at_consumers() {
+        for combined in [false, true] {
+            let mut db = DatabaseV2::load(DatabaseV2::test_platinum_path()).unwrap();
+            let cmd = db.commands.get_mut("LoadNationalDexRating").unwrap();
+            let result = cmd.params[0].clone();
+            let result_name = result.name.clone();
+            // This test-only macro consumes its inputs either separately or together.
+            cmd.params = ["first", "second"]
+                .into_iter()
+                .map(|name| ParamDef {
+                    name: name.to_string(),
+                    param_type: ParamType::Var,
+                    const_value: None,
+                    default: None,
+                    optional: false,
+                })
+                .chain([result])
+                .collect();
+            let mut expansion = if combined {
+                vec!["PlayCry $first, $second".to_string()]
+            } else {
+                vec!["PlayCry $first".to_string(), "PlayCry $second".to_string()]
+            };
+            expansion.push(format!("LoadPokedexRating TRUE, ${result_name}"));
+            cmd.expansion = Some(expansion);
+            for statement in [
+                "LoadNationalDexRating GetPlayerStarterSpecies(), GetPlayerStarterSpecies(), 0x8004",
+                "PlayCry LoadNationalDexRating(GetPlayerStarterSpecies(), GetPlayerStarterSpecies()).into(0x8004)",
+            ] {
+                let source = format!("script Test #1:\n    {statement}\n    End\n");
+                let (file, symbols) = parse_and_analyze_with_db(&source, &db);
+                let mut constants = ConstantDb::new();
+                constants.load_from_db(&db);
+                let mut lowerer = Lowerer::with_constants(&symbols, &db, &constants);
+                let result = lowerer.lower_script_file(&file);
+                if combined {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("would overwrite result variable 0x800C"),
+                        "{statement}"
+                    );
+                } else {
+                    let items = result.unwrap();
+                    let TopLevelItem::Function(function) = &items[0] else {
+                        panic!("Expected script");
+                    };
+                    let names: Vec<_> = function
+                        .instructions
+                        .iter()
+                        .filter_map(|op| match op {
+                            IrOpcode::Command { name, .. } => Some(name.as_str()),
+                            IrOpcode::Label(_) => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        &names[..5],
+                        [
+                            "GetPlayerStarterSpecies",
+                            "PlayCry",
+                            "GetPlayerStarterSpecies",
+                            "PlayCry",
+                            "LoadPokedexRating"
+                        ],
+                        "{statement}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_autovar_nested_inputs_remain_unsupported() {
+        let source = "script Test #1:\n    if AddItem(GetPlayerStarterSpecies().into(0x8004), 1).into(0x8005) then\n    endif\n    End\n";
+        let (file, symbols) = parse_and_analyze(source);
+        let mut lowerer = Lowerer::new(&symbols, create_test_db());
+        let error = lowerer.lower_script_file(&file).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Nested command calls in autovar inputs are not supported"),
+            "{error}"
         );
     }
 
