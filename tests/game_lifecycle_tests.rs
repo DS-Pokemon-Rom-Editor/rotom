@@ -1,7 +1,14 @@
-//! Full lifecycle integration tests: `rotom init` → `rotom convert` → `rotom compile`
+//! Compilation and binary-round-trip integration tests for the Rotom CLI.
 //!
-//! One test per game. Compile output must match known hashes (decomp: vendored
-//! manifest; DSPRE: snapshot of binary folder taken before compile).
+//! Compilation tests compile scripts from the decomp repositories and compare
+//! the output with the vendored SHA-256 hashes.
+//!
+//! Round-trip tests use those verified binaries as their baseline. They
+//! decompile the binaries, force a rebuild of the generated source, and check
+//! that the rebuilt binaries have the same hashes.
+//!
+//! DSPRE tests record the original binary hashes before conversion and compare
+//! the rebuilt binaries with that snapshot.
 //!
 //! ## Fixtures
 //! Decomp repos are auto-cloned on first run via `ensure_decomp_fixtures`.
@@ -16,7 +23,7 @@
 //! and prints a full breakdown of compile errors and hash mismatches.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -65,26 +72,24 @@ fn run_rotom(args: &[&str], cwd: &Path) -> Result<String, String> {
     Ok(stdout)
 }
 
-/// Assert that a `rotom compile` run actually rebuilt at least `minimum` files.
+/// Check that the CLI summary in `stdout` processed at least `minimum` files.
 ///
-/// `rotom convert` records DSPRE sources it generated from binaries as already
-/// up to date, so a plain `rotom compile` afterwards skips every file and the
-/// hash verification then checks binaries nothing ever rewrote. The lifecycle
-/// tests force a rebuild; this guards against that guarantee silently lapsing.
-fn assert_rebuilt(stdout: &str, minimum: usize) {
+/// Include `phase` in failures. This prevents a round-trip check from passing
+/// when files were not decompiled or the compiler skipped their rebuild.
+fn assert_processed(stdout: &str, minimum: usize, phase: &str) {
     let summary = stdout
         .lines()
         .rev()
         .find_map(|line| line.strip_prefix("Done: "))
-        .unwrap_or_else(|| panic!("no compile summary in rotom output:\n{stdout}"));
-    let compiled: usize = summary
+        .unwrap_or_else(|| panic!("no {phase} summary in rotom output:\n{stdout}"));
+    let processed: usize = summary
         .split('/')
         .next()
         .and_then(|count| count.trim().parse().ok())
-        .unwrap_or_else(|| panic!("unparsable compile summary 'Done: {summary}'"));
+        .unwrap_or_else(|| panic!("unparsable {phase} summary 'Done: {summary}'"));
     assert!(
-        compiled >= minimum,
-        "compile rebuilt only {compiled} file(s), expected at least {minimum}; \
+        processed >= minimum,
+        "{phase} processed only {processed} file(s), expected at least {minimum}; \
          the round-trip check would be vacuous\n{stdout}"
     );
 }
@@ -97,6 +102,20 @@ fn copy_fixture(src: &Path, dst: &Path) {
         .status()
         .expect("cp -r failed — is this a Unix system?");
     assert!(status.success(), "cp -r exited with failure");
+}
+
+/// Copy `fixture` into the isolated directory for `test_name` and compile it.
+///
+/// Run init, conversion, and compilation in the copy, then return its path.
+fn compile_decomp_fixture(fixture: &str, test_name: &str) -> PathBuf {
+    ensure_decomp_fixtures();
+    let project = persistent_test_dir(test_name);
+    copy_fixture(&fixture_root().join("decomp").join(fixture), &project);
+
+    run_rotom(&["init", "--non-interactive"], &project).expect("baseline init failed");
+    run_rotom(&["convert", "--non-interactive"], &project).expect("baseline conversion failed");
+    run_rotom(&["compile"], &project).expect("baseline compilation failed");
+    project
 }
 
 // ── Hashing helpers ────────────────────────────────────────────────────────────
@@ -386,14 +405,7 @@ fn print_hash_report(
 /// Known hashes: vendored SHA-256 manifest of pokeplatinum compiled binaries.
 #[test]
 fn test_lifecycle_platinum_decomp() {
-    ensure_decomp_fixtures();
-
-    let project = persistent_test_dir("lifecycle_platinum_decomp");
-    copy_fixture(&fixture_root().join("decomp/pokeplatinum"), &project);
-
-    run_rotom(&["init", "--non-interactive"], &project).expect("rotom init failed");
-    run_rotom(&["convert", "--non-interactive"], &project).expect("rotom convert failed");
-    run_rotom(&["compile"], &project).expect("rotom compile failed");
+    let project = compile_decomp_fixture("pokeplatinum", "lifecycle_platinum_decomp");
 
     let expected = parse_manifest_by_stem(known_hashes::POKEPLATINUM_FIELD_SCRIPT_HASHES);
     verify_compiled_binaries(
@@ -409,14 +421,7 @@ fn test_lifecycle_platinum_decomp() {
 /// Known hashes: vendored SHA-256 manifest of pokeheartgold compiled binaries.
 #[test]
 fn test_lifecycle_heartgold_decomp() {
-    ensure_decomp_fixtures();
-
-    let project = persistent_test_dir("lifecycle_heartgold_decomp");
-    copy_fixture(&fixture_root().join("decomp/pokeheartgold"), &project);
-
-    run_rotom(&["init", "--non-interactive"], &project).expect("rotom init failed");
-    run_rotom(&["convert", "--non-interactive"], &project).expect("rotom convert failed");
-    run_rotom(&["compile"], &project).expect("rotom compile failed");
+    let project = compile_decomp_fixture("pokeheartgold", "lifecycle_heartgold_decomp");
 
     let expected = parse_manifest_by_stem(known_hashes::POKEHEARTGOLD_FIELD_SCRIPT_HASHES);
     verify_compiled_binaries(
@@ -424,6 +429,50 @@ fn test_lifecycle_heartgold_decomp() {
         &expected,
         Some("bin"),
     );
+}
+
+/// Verify a Platinum binary round trip in its own checksum-verified fixture copy.
+#[test]
+fn test_roundtrip_platinum_decomp() {
+    let project = compile_decomp_fixture("pokeplatinum", "roundtrip_platinum_decomp");
+    let binary_root = project.join("build/res/field/scripts/scr_seq.narc.p");
+    let expected = parse_manifest_by_stem(known_hashes::POKEPLATINUM_FIELD_SCRIPT_HASHES);
+    println!("Checking compiled Platinum baseline against the trusted hashes");
+    verify_compiled_binaries(&binary_root, &expected, None);
+
+    let stdout = run_rotom(&["decompile"], &project)
+        .expect("Platinum round-trip decompilation failed after baseline verification");
+    assert_processed(&stdout, expected.len(), "Platinum round-trip decompilation");
+    let stdout = run_rotom(&["compile", "--force"], &project)
+        .expect("Platinum round-trip rebuild failed after baseline verification");
+    assert_processed(&stdout, expected.len(), "Platinum round-trip rebuild");
+
+    println!("Checking Platinum round-trip output against the same trusted hashes");
+    verify_compiled_binaries(&binary_root, &expected, None);
+}
+
+/// Verify a `HeartGold` binary round trip in its own checksum-verified fixture copy.
+#[test]
+fn test_roundtrip_heartgold_decomp() {
+    let project = compile_decomp_fixture("pokeheartgold", "roundtrip_heartgold_decomp");
+    let binary_root = project.join("files/fielddata/script/scr_seq");
+    let expected = parse_manifest_by_stem(known_hashes::POKEHEARTGOLD_FIELD_SCRIPT_HASHES);
+    println!("Checking compiled HeartGold baseline against the trusted hashes");
+    verify_compiled_binaries(&binary_root, &expected, Some("bin"));
+
+    let stdout = run_rotom(&["decompile"], &project)
+        .expect("HeartGold round-trip decompilation failed after baseline verification");
+    assert_processed(
+        &stdout,
+        expected.len(),
+        "HeartGold round-trip decompilation",
+    );
+    let stdout = run_rotom(&["compile", "--force"], &project)
+        .expect("HeartGold round-trip rebuild failed after baseline verification");
+    assert_processed(&stdout, expected.len(), "HeartGold round-trip rebuild");
+
+    println!("Checking HeartGold round-trip output against the same trusted hashes");
+    verify_compiled_binaries(&binary_root, &expected, Some("bin"));
 }
 
 /// DSPRE Platinum: snapshot binary hashes → init → convert (.script → .rotom/.json)
@@ -447,7 +496,7 @@ fn test_lifecycle_platinum_dspre() {
     run_rotom(&["init", "--non-interactive"], &project).expect("rotom init failed");
     run_rotom(&["convert", "--non-interactive"], &project).expect("rotom convert failed");
     let stdout = run_rotom(&["compile", "--force"], &project).expect("rotom compile failed");
-    assert_rebuilt(&stdout, expected.len());
+    assert_processed(&stdout, expected.len(), "Platinum DSPRE rebuild");
 
     verify_compiled_binaries(&binary_root, &expected, None);
 }
@@ -479,7 +528,7 @@ fn test_lifecycle_heartgold_dspre() {
         "HeartGold DSPRE conversion did not resolve common script 2041"
     );
     let stdout = run_rotom(&["compile", "--force"], &project).expect("rotom compile failed");
-    assert_rebuilt(&stdout, expected.len());
+    assert_processed(&stdout, expected.len(), "HeartGold DSPRE rebuild");
 
     verify_compiled_binaries(&binary_root, &expected, None);
 }
