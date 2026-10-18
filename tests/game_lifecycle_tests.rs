@@ -3,9 +3,12 @@
 //! Compilation tests compile scripts from the decomp repositories and compare
 //! the output with the vendored SHA-256 hashes.
 //!
-//! Round-trip tests use those verified binaries as their baseline. They
-//! decompile the binaries, force a rebuild of the generated source, and check
-//! that the rebuilt binaries have the same hashes.
+//! Platinum and HGSS round-trip tests decompile those verified binaries, force a
+//! rebuild of the generated source, and check that the rebuilt binaries have
+//! the same hashes.
+//!
+//! The Diamond round-trip test starts with the binaries in the pinned decomp
+//! repository and checks rebuilt files against the vendored SHA-256 hashes.
 //!
 //! DSPRE tests record the original binary hashes before conversion and compare
 //! the rebuilt binaries with that snapshot.
@@ -15,7 +18,7 @@
 //! DSPRE fixtures must be present manually; tests are silently skipped otherwise.
 //!
 //! ## Verbose mode
-//! Each game has an `#[ignore]`-gated verbose variant. Run with:
+//! Platinum and HGSS have `#[ignore]`-gated verbose variants. Run with:
 //! ```bash
 //! cargo test <game>_verbose --ignored -- --nocapture
 //! ```
@@ -27,6 +30,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+
+use rotom::project::config::{
+    DatabaseConfig, PathsConfig, ProjectMetadata, ProjectTypeConfig, RotomConfig, WorkspaceConfig,
+};
 
 mod common;
 mod known_hashes;
@@ -127,7 +134,7 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// Snapshot SHA256 of every regular file in `dir` (non-recursive).
-/// Keys are filename stems (extension stripped); used for DSPRE round-trip.
+/// Keys are filename stems (extension stripped).
 fn snapshot_dir_hashes(dir: &Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for entry in std::fs::read_dir(dir)
@@ -169,7 +176,7 @@ fn parse_manifest_by_stem(manifest: &str) -> HashMap<String, String> {
 ///
 /// `binary_ext`:
 /// - `None`        → only visit extensionless files (Platinum decomp, DSPRE)
-/// - `Some("bin")` → only visit `.bin` files (`HeartGold` decomp)
+/// - `Some("bin")` → only visit `.bin` files (Diamond and `HeartGold`)
 fn verify_compiled_binaries(
     binary_root: &Path,
     expected_by_stem: &HashMap<String, String>,
@@ -472,6 +479,77 @@ fn test_roundtrip_heartgold_decomp() {
     assert_processed(&stdout, expected.len(), "HeartGold round-trip rebuild");
 
     println!("Checking HeartGold round-trip output against the same trusted hashes");
+    verify_compiled_binaries(&binary_root, &expected, Some("bin"));
+}
+
+/// Verify a Diamond binary round trip against the vendored SHA-256 hashes.
+#[test]
+fn test_roundtrip_diamond_decomp() {
+    ensure_decomp_fixtures();
+    let project = persistent_test_dir("roundtrip_diamond_decomp");
+    let binary_root = project.join("binaries");
+    std::fs::create_dir_all(&binary_root).unwrap();
+    let fixture_binaries =
+        fixture_root().join("decomp/pokediamond/files/fielddata/script/scr_seq_release");
+    for entry in std::fs::read_dir(&fixture_binaries).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "bin") {
+            std::fs::copy(&path, binary_root.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    let expected = parse_manifest_by_stem(known_hashes::POKEDIAMOND_FIELD_SCRIPT_HASHES);
+    assert_eq!(
+        expected.len(),
+        1051,
+        "unexpected pinned Diamond corpus size"
+    );
+    let empty_hash = sha256_hex(&[]);
+    let nonempty_count = expected
+        .values()
+        .filter(|hash| **hash != empty_hash)
+        .count();
+
+    // Test the binary toolchain without requiring a ROM or a Diamond project adapter.
+    let database_dir = project.join(".rotom/command_database");
+    std::fs::create_dir_all(&database_dir).unwrap();
+    std::fs::copy(
+        rotom::DatabaseV2::test_db_root().join("diamond_pearl_v2.json"),
+        database_dir.join("diamond_pearl_v2.json"),
+    )
+    .unwrap();
+    let config = RotomConfig {
+        format_version: 1,
+        project: ProjectMetadata {
+            name: "diamond_roundtrip".to_string(),
+        },
+        workspace: WorkspaceConfig {
+            project_type: ProjectTypeConfig::Generic,
+            game_family: Some(rotom::GameFamily::DP),
+        },
+        paths: PathsConfig {
+            database_dir: ".rotom/command_database".to_string(),
+            cache_dir: ".rotom/cache".to_string(),
+            status_dir: ".rotom/status".to_string(),
+            source_roots: vec!["scripts".to_string()],
+            include_roots: Vec::new(),
+            binary_roots: vec!["binaries".to_string()],
+        },
+        database: Some(DatabaseConfig {
+            default_file: ".rotom/command_database/diamond_pearl_v2.json".to_string(),
+        }),
+    };
+    std::fs::write(
+        project.join("rotom.toml"),
+        toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let stdout =
+        run_rotom(&["decompile"], &project).expect("Diamond round-trip decompilation failed");
+    assert_processed(&stdout, nonempty_count, "Diamond round-trip decompilation");
+    let stdout =
+        run_rotom(&["compile", "--force"], &project).expect("Diamond round-trip rebuild failed");
+    assert_processed(&stdout, nonempty_count, "Diamond round-trip rebuild");
     verify_compiled_binaries(&binary_root, &expected, Some("bin"));
 }
 

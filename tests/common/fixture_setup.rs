@@ -12,11 +12,9 @@ static FIXTURE_INIT: Once = Once::new();
 
 /// Ensure all decomp fixtures are present. Auto-clones via git if missing.
 ///
-/// Each fixture is checked out at the decomp revision the embedded command
-/// database was synced from, so database and fixture cannot drift apart. The
-/// pinned commits are only a fallback for databases that predate provenance
-/// tracking; using one is worth a warning because it is exactly the drift that
-/// broke compilation before.
+/// Assembly fixtures use the revision recorded in the embedded command database.
+/// If that revision is absent, use the fixture pin and print a warning.
+/// Binary-only fixtures use their version-controlled pin.
 ///
 /// Uses `std::sync::Once` so that even when `cargo test` runs tests in
 /// parallel within the same binary, git operations happen exactly once.
@@ -31,16 +29,16 @@ pub fn ensure_decomp_fixtures() {
                 "pokeplatinum" => Some(rotom::database::DatabaseV2::test_platinum()),
                 _ => None,
             };
-            let commit = db
-                .and_then(|db| db.meta.decomp_commit.as_deref())
-                .unwrap_or_else(|| {
+            let commit = db.map_or(pin.commit, |db| {
+                db.meta.decomp_commit.as_deref().unwrap_or_else(|| {
                     eprintln!(
                         "[fixtures] {} database carries no decomp provenance; \
                          falling back to pinned commit {}",
                         pin.name, pin.commit
                     );
                     pin.commit
-                });
+                })
+            });
 
             let dest = root.join("decomp").join(pin.name);
             if dest.exists() {

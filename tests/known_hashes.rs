@@ -3,3 +3,6 @@ pub const POKEPLATINUM_FIELD_SCRIPT_HASHES: &str =
 
 pub const POKEHEARTGOLD_FIELD_SCRIPT_HASHES: &str =
     include_str!("known_hashes/pokeheartgold_field_scripts.sha256");
+
+pub const POKEDIAMOND_FIELD_SCRIPT_HASHES: &str =
+    include_str!("known_hashes/pokediamond_field_scripts.sha256");
