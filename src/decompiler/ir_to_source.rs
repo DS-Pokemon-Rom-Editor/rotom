@@ -97,6 +97,9 @@ fn format_arg(
     }
 }
 
+/// Render `args` for `name` with batch global labels before existing source labels.
+///
+/// Return the argument strings and an optional annotation. No files are changed.
 fn format_command_args(
     name: &str,
     args: &[Arg],
@@ -118,10 +121,29 @@ fn format_command_args(
             && i == 0
             && let (Some(project), Arg::Value(value)) = (project, arg)
             && let Ok(script_id) = u16::try_from(*value)
-            && let Some(resolved) = project.resolve_global_script_id(script_id)
         {
-            formatted.push(format!("{}::{}", resolved.module, resolved.reference_label));
-            continue;
+            let batch_target = workspace
+                .and_then(|ws| ws.global_script_table.lookup(script_id))
+                .and_then(|entry| {
+                    context
+                        .global_script_names?
+                        .get(&entry.script_file_id)
+                        .map(|names| (entry, names))
+                });
+            let reference = if let Some((entry, names)) = batch_target {
+                let slot = u32::from(script_id - entry.min_script_id);
+                names
+                    .get(&slot)
+                    .map(|label| format!("{}::{label}", entry.range.module_name()))
+            } else {
+                project
+                    .resolve_global_script_id(script_id)
+                    .map(|resolved| format!("{}::{}", resolved.module, resolved.reference_label))
+            };
+            if let Some(reference) = reference {
+                formatted.push(reference);
+                continue;
+            }
         }
         formatted.push(format_arg(arg, param_name, constants, db.game_family()));
 

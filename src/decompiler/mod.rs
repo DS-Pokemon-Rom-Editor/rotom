@@ -3,6 +3,8 @@ pub mod disassembler;
 pub mod ir_to_source;
 pub mod levelscript;
 
+use std::collections::HashMap;
+
 use crate::{ConstantDb, DatabaseV2, ProjectContext};
 
 /// Borrowed resources used to render disassembled scripts.
@@ -11,6 +13,9 @@ pub struct DecompileContext<'a> {
     db: &'a DatabaseV2,
     constants: Option<&'a ConstantDb>,
     project: Option<&'a ProjectContext>,
+    /// Batch global file ID -> zero-based slot -> emitted reference label.
+    /// A selected file with no valid headers has an empty map, not stale source names.
+    pub(crate) global_script_names: Option<&'a HashMap<u16, HashMap<u32, String>>>,
 }
 
 impl<'a> DecompileContext<'a> {
@@ -20,6 +25,7 @@ impl<'a> DecompileContext<'a> {
             db: project.db(),
             constants: Some(project.project_constants()),
             project: Some(project),
+            global_script_names: None,
         }
     }
 
@@ -29,6 +35,7 @@ impl<'a> DecompileContext<'a> {
             db,
             constants,
             project: None,
+            global_script_names: None,
         }
     }
 

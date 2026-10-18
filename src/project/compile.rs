@@ -1,8 +1,10 @@
 use crate::{
     BatchCompileResult, BatchDecompileResult, CompileError, CompileFailure, CompiledFile,
-    ConstantDb, DecompileFailure, GameFamily, decompile_file_internal,
+    ConstantDb, DecompileFailure, GameFamily, decompile_file_from_ir, decompile_to_ir,
 };
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::fs;
@@ -12,6 +14,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::config::{ProjectTypeConfig, RotomConfig};
 use super::error::{IoSnafu, ProjectError, Result};
 use crate::compile_state::{BinaryQuirk, COMPILER_VERSION, CompileState, FileState, FileStatus};
+use crate::compiler::ir::TopLevelItem;
+use crate::decompiler::{DecompileError, ScriptOutput};
 
 enum WorkerResult {
     Skip {
@@ -397,8 +401,11 @@ pub fn decompile_project(root: &Path, config: &RotomConfig) -> Result<BatchDecom
 
 /// Decompile only `files` with the full project context, or every binary when `files` is empty.
 ///
+/// Disassemble in parallel, collect global labels from the retained IR, then write sources
+/// in parallel. Selected global files use their generated labels, not old source labels.
 /// Only a full run marks the compile state as current, so a partial run never hides a rebuild the
 /// other entries need.
+#[allow(clippy::too_many_lines)] // Keep the three batch stages and their shared resources together.
 pub fn decompile_project_files(
     root: &Path,
     config: &RotomConfig,
@@ -433,17 +440,81 @@ pub fn decompile_project_files(
             .unwrap()
             .progress_chars("#>-"),
     );
-    progress.set_message("");
+    progress.set_message("Disassembling");
 
-    let results: Vec<std::result::Result<crate::DecompileFileResult, DecompileFailure>> = work
+    let disassembled: Vec<_> = work
         .par_iter()
-        .map(|(input, output_dir)| {
-            let result = decompile_file_internal(
-                input,
-                None,
-                Some(output_dir),
-                crate::DecompileContext::for_project(&project),
-            );
+        .map(|(input, _)| {
+            let bytes = fs::read(input).map_err(|error| DecompileFailure {
+                path: input.clone(),
+                error: DecompileError::Io {
+                    message: format!("Failed to read input file '{}': {error}", input.display()),
+                },
+            })?;
+            decompile_to_ir(bytes, project.db()).map_err(|error| DecompileFailure {
+                path: input.clone(),
+                error,
+            })
+        })
+        .collect();
+
+    let mut global_script_names = HashMap::new();
+    if let Some(workspace) = project.workspace() {
+        for ((input, _), output) in work.iter().zip(&disassembled) {
+            let Some(file_id) = input
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|name| workspace.scripts.get_id(name).or_else(|| name.parse().ok()))
+                .and_then(|id| u16::try_from(id).ok())
+            else {
+                continue;
+            };
+            if workspace
+                .global_script_table
+                .find_by_script_file_id(file_id)
+                .is_none()
+            {
+                continue;
+            }
+            let names = global_script_names
+                .entry(file_id)
+                .or_insert_with(HashMap::new);
+            let Ok(ScriptOutput::Normal { items, .. }) = output else {
+                continue;
+            };
+            for item in items {
+                let TopLevelItem::Function(function) = item else {
+                    continue;
+                };
+                let headers: Vec<_> = function
+                    .headers
+                    .iter()
+                    .filter(|header| header.is_public)
+                    .filter_map(|header| header.id.map(|slot| (slot, header.name.as_str())))
+                    .collect();
+                for &(slot, name) in &headers {
+                    // One generated label can cover several slots. Keep the same
+                    // unambiguous spelling as source-backed global resolution.
+                    let label = if headers.len() == 1 || name == format!("script_{}", slot + 1) {
+                        name.to_string()
+                    } else {
+                        (slot + 1).to_string()
+                    };
+                    names.insert(slot, label);
+                }
+            }
+        }
+    }
+
+    let mut context = crate::DecompileContext::for_project(&project);
+    context.global_script_names = Some(&global_script_names);
+    progress.set_message("Writing");
+    let results: Vec<_> = work
+        .par_iter()
+        .zip(disassembled.into_par_iter())
+        .map(|((input, output_dir), output)| {
+            let result = output
+                .and_then(|ir| decompile_file_from_ir(input, &ir, None, Some(output_dir), context));
             progress.inc(1);
             result
         })
@@ -1113,61 +1184,150 @@ mod tests {
         assert!(root.join("build/scripts/0001").exists());
     }
 
+    /// Check batch references against generated global labels, including a first export.
     #[test]
     fn decompile_project_writes_into_source_root() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join("scripts")).unwrap();
+        let mut config = project_config(ProjectTypeConfig::Dspre);
+        config.paths.source_roots = vec!["expanded/scripts".to_string()];
+        let scripts = root.join("expanded/scripts");
+        fs::create_dir_all(&scripts).unwrap();
         fs::write(
-            root.join("scripts/0001.rotom"),
-            "script Main #1:\n    End\n",
+            scripts.join("0001.rotom"),
+            "script Main #1:\n    CallCommonScript 2002\n    End\n",
+        )
+        .unwrap();
+        fs::write(
+            scripts.join("0211.rotom"),
+            concat!(
+                "script First #1:\n    CallCommonScript 2002\n    ReturnCommonScript\n",
+                "script Second #2:\n    ReturnCommonScript\n",
+                "script Third #3:\n    CallCommonScript 2001\n    ReturnCommonScript\n",
+            ),
         )
         .unwrap();
 
-        compile_project(root, &project_config(ProjectTypeConfig::Dspre), false).unwrap();
-        fs::remove_file(root.join("scripts/0001.rotom")).unwrap();
+        compile_project(root, &config, false).unwrap();
+        let original_caller = fs::read(root.join("build/scripts/0001")).unwrap();
+        let original_global = fs::read(root.join("build/scripts/0211")).unwrap();
 
-        let result = decompile_project(root, &project_config(ProjectTypeConfig::Dspre))
-            .expect("project decompile should succeed");
+        // Enable the real Platinum global table after fixture compilation.
+        let mut header = [0_u8; 512];
+        header[12..16].copy_from_slice(b"CPUE");
+        fs::write(root.join("header.bin"), header).unwrap();
+        fs::write(root.join("arm9.bin"), []).unwrap();
+        fs::create_dir_all(root.join("expanded/textArchives")).unwrap();
+        fs::write(
+            root.join("expanded/textArchives/0213.json"),
+            r#"{"key": 0, "messages": []}"#,
+        )
+        .unwrap();
 
-        assert!(result.is_success());
-        assert!(root.join("scripts/0001.rotom").exists());
+        // Existing labels must not survive when their files are regenerated.
+        for fresh_export in [false, true] {
+            if fresh_export {
+                fs::remove_file(scripts.join("0001.rotom")).unwrap();
+                fs::remove_file(scripts.join("0211.rotom")).unwrap();
+            }
+            let result = decompile_project(root, &config).unwrap();
+            assert!(result.is_success(), "{:?}", result.failures);
+            let caller = fs::read_to_string(scripts.join("0001.rotom")).unwrap();
+            let global = fs::read_to_string(scripts.join("0211.rotom")).unwrap();
+            assert!(
+                caller.contains("CallCommonScript CommonScripts::script_3"),
+                "{caller}"
+            );
+            assert!(
+                global.contains("CallCommonScript CommonScripts::script_3"),
+                "{global}"
+            );
+            assert!(
+                global.contains("CallCommonScript CommonScripts::script_2"),
+                "{global}"
+            );
+            compile_project(root, &config, true).unwrap();
+            assert_eq!(
+                fs::read(root.join("build/scripts/0001")).unwrap(),
+                original_caller
+            );
+            assert_eq!(
+                fs::read(root.join("build/scripts/0211")).unwrap(),
+                original_global
+            );
+        }
     }
 
+    /// Check partial exports, external source labels, and failed global targets.
     #[test]
     fn decompile_project_files_writes_only_the_named_sources() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join("scripts")).unwrap();
+        let mut config = project_config(ProjectTypeConfig::Dspre);
+        config.paths.source_roots = vec!["expanded/scripts".to_string()];
+        let scripts = root.join("expanded/scripts");
+        fs::create_dir_all(&scripts).unwrap();
         fs::write(
-            root.join("scripts/0001.rotom"),
-            "script Main #1:\n    End\n",
+            scripts.join("0001.rotom"),
+            "script Main #1:\n    CallCommonScript 2002\n    End\n",
         )
         .unwrap();
-        fs::write(
-            root.join("scripts/0002.rotom"),
-            "script Main #1:\n    End\n",
-        )
-        .unwrap();
-        let config = project_config(ProjectTypeConfig::Dspre);
+        fs::write(scripts.join("0002.rotom"), "script Main #1:\n    End\n").unwrap();
+        let global_source = "script HealParty #3:\n    ReturnCommonScript\n";
+        fs::write(scripts.join("0211.rotom"), global_source).unwrap();
 
         compile_project(root, &config, false).unwrap();
-        fs::write(root.join("scripts/0001.rotom"), "stale").unwrap();
-        fs::write(root.join("scripts/0002.rotom"), "untouched").unwrap();
+        let mut header = [0_u8; 512];
+        header[12..16].copy_from_slice(b"CPUE");
+        fs::write(root.join("header.bin"), header).unwrap();
+        fs::write(root.join("arm9.bin"), []).unwrap();
+        fs::write(scripts.join("0001.rotom"), "stale").unwrap();
+        fs::write(scripts.join("0002.rotom"), "untouched").unwrap();
 
         let result = decompile_project_files(root, &config, &[root.join("build/scripts/0001")])
             .expect("single-file project decompile should succeed");
 
         assert!(result.is_success());
         assert_eq!(result.successes.len(), 1);
-        assert_ne!(
-            fs::read_to_string(root.join("scripts/0001.rotom")).unwrap(),
-            "stale"
+        let caller = fs::read_to_string(scripts.join("0001.rotom")).unwrap();
+        assert!(
+            caller.contains("CallCommonScript CommonScripts::HealParty"),
+            "{caller}"
         );
         assert_eq!(
-            fs::read_to_string(root.join("scripts/0002.rotom")).unwrap(),
+            fs::read_to_string(scripts.join("0211.rotom")).unwrap(),
+            global_source
+        );
+        assert_eq!(
+            fs::read_to_string(scripts.join("0002.rotom")).unwrap(),
             "untouched"
         );
+
+        // A failed selected global must not use its obsolete source labels.
+        fs::write(root.join("build/scripts/0211"), [1]).unwrap();
+        let result = decompile_project_files(
+            root,
+            &config,
+            &[
+                root.join("build/scripts/0001"),
+                root.join("build/scripts/0211"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result.successes.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        let caller = fs::read_to_string(scripts.join("0001.rotom")).unwrap();
+        assert!(caller.contains("CallCommonScript 2002"), "{caller}");
+        assert_eq!(
+            fs::read_to_string(scripts.join("0211.rotom")).unwrap(),
+            global_source
+        );
+
+        fs::remove_file(scripts.join("0211.rotom")).unwrap();
+        decompile_project_files(root, &config, &[root.join("build/scripts/0001")]).unwrap();
+        assert!(!scripts.join("0211.rotom").exists());
+        let caller = fs::read_to_string(scripts.join("0001.rotom")).unwrap();
+        assert!(caller.contains("CallCommonScript 2002"), "{caller}");
 
         let missing = decompile_project_files(root, &config, &[root.join("build/scripts/9999")]);
         assert!(matches!(
