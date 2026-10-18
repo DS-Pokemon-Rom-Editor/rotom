@@ -184,13 +184,19 @@ impl ProjectContext {
             }
             ProjectTypeConfig::Dspre => {
                 let workspace = open_workspace(root, config, optional_workspace)?;
+                let family = workspace
+                    .as_ref()
+                    .map(|workspace| workspace.family)
+                    .or_else(|| config.game_family());
                 let language = if let Some(workspace) = &workspace {
                     project_constants.load_dspre_symbols((*workspace.symbols).clone());
                     workspace.language
                 } else {
                     uxie::GameLanguage::English
                 };
-                let _ = project_constants.load_dspre_text_archives(root, language);
+                if let Some(family) = family {
+                    let _ = project_constants.load_dspre_text_archives(root, family, language);
+                }
                 workspace
             }
             ProjectTypeConfig::HgEngine => {

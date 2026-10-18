@@ -407,17 +407,24 @@ pub fn convert_project(
             }
         }
         ProjectTypeConfig::Dspre => {
-            let language = match Workspace::open(root) {
+            let (family, language) = match Workspace::open(root) {
                 Ok(workspace) => {
+                    let family = workspace.family;
                     let language = workspace.language;
                     let _ = constants.load_dspre_symbols((*workspace.symbols).clone());
                     dspre_workspace = Some(Arc::new(workspace));
-                    language
+                    (family, language)
                 }
-                Err(_) => uxie::GameLanguage::English,
+                Err(_) => (
+                    config
+                        .game_family()
+                        .or_else(|| db.as_ref().and_then(|db| db.game_family()))
+                        .ok_or(ProjectError::MissingGameFamily)?,
+                    uxie::GameLanguage::English,
+                ),
             };
             let _ = constants
-                .load_dspre_text_archives(root, language)
+                .load_dspre_text_archives(root, family, language)
                 .map_err(ProjectError::from)?;
         }
         ProjectTypeConfig::Generic | ProjectTypeConfig::HgEngine => {}

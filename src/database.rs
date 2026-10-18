@@ -13,6 +13,7 @@ use crate::compiler::ParseResult;
 use crate::compiler::diagnostic::{CompileError, database_error};
 pub use uxie::GameFamily;
 use uxie::c_parser::defines::eval_expr_with_parent;
+use uxie::text_bank::game_strings::TextBankIds;
 use uxie::{GameLanguage, SymbolTable};
 
 pub fn normalize_command_name(name: &str) -> String {
@@ -914,69 +915,42 @@ impl ConstantDb {
         count
     }
 
+    /// Load named constants from the archives for `family` and `language` under `root`.
+    ///
+    /// Add the constants to this database and return the number loaded.
+    /// Missing archives are skipped. Archive encryption keys are not used.
     pub fn load_dspre_text_archives<P: AsRef<Path>>(
         &mut self,
         root: P,
+        family: GameFamily,
         language: GameLanguage,
     ) -> Result<usize, CompileError> {
-        #[derive(Deserialize)]
-        struct DspreArchiveKey {
-            key: u16,
-        }
-
         let archives_dir = root.as_ref().join("expanded/textArchives");
         if !archives_dir.is_dir() {
             return Ok(0);
         }
 
+        let bank_ids = TextBankIds::for_game(family, language);
         let mut symbols = SymbolTable::default();
         let mut total = 0;
 
-        let entries = fs::read_dir(&archives_dir).map_err(|e| CompileError::Database {
-            message: format!(
-                "Failed to read DSPRE text archives directory '{}': {}",
-                archives_dir.display(),
-                e
-            ),
-        })?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| CompileError::Database {
-                message: format!(
-                    "Failed to read DSPRE text archive entry in '{}': {}",
-                    archives_dir.display(),
-                    e
-                ),
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        for (archive_id, prefix, index_suffix_width) in [
+            (bank_ids.items, "ITEM_", None),
+            (bank_ids.species, "SPECIES_", None),
+            (bank_ids.locations, "LOCATION_", None),
+            (bank_ids.trainers, "TRAINER_", Some(3)),
+            (bank_ids.trainer_classes, "TRAINER_CLASS_", None),
+            (bank_ids.moves, "MOVE_", None),
+            (bank_ids.sounds, "SEQ_", None),
+        ] {
+            let path = archives_dir.join(format!("{archive_id:04}.json"));
+            if !path.is_file() {
                 continue;
             }
 
-            let content = fs::read_to_string(&path).map_err(|e| CompileError::Database {
-                message: format!(
-                    "Failed to read DSPRE text archive '{}': {}",
-                    path.display(),
-                    e
-                ),
-            })?;
-            let archive = serde_json::from_str::<DspreArchiveKey>(&content).map_err(|e| {
-                CompileError::Database {
-                    message: format!(
-                        "Failed to parse DSPRE text archive key from '{}': {}",
-                        path.display(),
-                        e
-                    ),
-                }
-            })?;
-
-            if archive.key == 12973 {
-                // German Diamond Rev5 has 829 placeholder ("----------") entries at
-                // key 12973, matching neither Platinum (1013) nor HGSS (1372). Skip
-                // unrecognised row counts and fall back to bundled DB sound constants.
-                // TODO: research sound archives across all regional/revision variants —
-                // other versions may have populated archives under a different ID or
-                // with a different row count that needs its own offset mapping.
+            if archive_id == bank_ids.sounds {
+                // DP has 829 rows, with placeholders in the Western releases.
+                // Keep the DB sound constants for unsupported sound ID mappings.
                 match symbols.load_dspre_sound_archive_constants(&path, language) {
                     Ok(n) => total += n,
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
@@ -992,12 +966,6 @@ impl ConstantDb {
                 }
                 continue;
             }
-
-            let Some((prefix, index_suffix_width)) =
-                Self::dspre_text_archive_constant_format(archive.key)
-            else {
-                continue;
-            };
 
             total += symbols
                 .load_text_bank_json_constants(&path, prefix, index_suffix_width, language)
@@ -1298,20 +1266,6 @@ impl ConstantDb {
         }
 
         Ok(false)
-    }
-
-    fn dspre_text_archive_constant_format(key: u16) -> Option<(&'static str, Option<usize>)> {
-        match key {
-            51885 => Some(("ITEM_", None)),
-            // English, Japanese, and German Platinum species archives.
-            30764 | 53262 => Some(("SPECIES_", None)),
-            2566 => Some(("LOCATION_", None)),
-            55533 => Some(("TRAINER_", Some(3))),
-            64556 => Some(("TRAINER_CLASS_", None)),
-            // Platinum move names (e.g. Tackle) and HGSS all-caps move names (e.g. EXTREMESPEED).
-            63689 | 22192 => Some(("MOVE_", None)),
-            _ => None,
-        }
     }
 
     pub fn get(&self, name: &str) -> Option<i32> {
@@ -2049,6 +2003,7 @@ mod tests {
         );
     }
 
+    /// Check archive categories and name lookup with shared encryption keys.
     #[test]
     fn test_load_dspre_text_archives_emits_canonicalized_constants() {
         let temp_dir = unique_temp_dir("dspre_text_archives");
@@ -2059,7 +2014,7 @@ mod tests {
             archives_dir.join("0412.json"),
             concat!(
                 "{\n",
-                "  \"key\": 30764,\n",
+                "  \"key\": 53262,\n",
                 "  \"messages\": [\n",
                 "    { \"id\": \"msg_0412_00000\", \"en_US\": \"-----\" },\n",
                 "    { \"id\": \"msg_0412_00001\", \"en_US\": \"Farfetch'd\" },\n",
@@ -2074,7 +2029,7 @@ mod tests {
             archives_dir.join("0618.json"),
             concat!(
                 "{\n",
-                "  \"key\": 55533,\n",
+                "  \"key\": 53262,\n",
                 "  \"messages\": [\n",
                 "    { \"id\": \"msg_0618_00000\", \"en_US\": \"{TRAINER_NAME: -}\" },\n",
                 "    { \"id\": \"msg_0618_00001\", \"en_US\": \"{TRAINER_NAME:Silver}\" },\n",
@@ -2084,10 +2039,15 @@ mod tests {
             ),
         )
         .expect("failed to write trainer archive");
+        fs::write(
+            archives_dir.join("0005.json"),
+            r#"{"key": 53262, "messages": [{"id": "msg_0005_00000", "en_US": "HP"}]}"#,
+        )
+        .expect("failed to write unrelated archive");
 
         let mut constants = ConstantDb::new();
         let loaded = constants
-            .load_dspre_text_archives(&temp_dir, GameLanguage::English)
+            .load_dspre_text_archives(&temp_dir, GameFamily::Platinum, GameLanguage::English)
             .expect("failed to load dspre text archives");
 
         fs::remove_dir_all(&temp_dir).ok();
@@ -2102,8 +2062,15 @@ mod tests {
         assert_eq!(constants.get("TRAINER_NONE"), Some(0));
         assert_eq!(constants.get("TRAINER_SILVER_001"), Some(1));
         assert_eq!(constants.get("TRAINER_AMY_AND_MIMI_002"), Some(2));
+        assert_eq!(constants.get("SPECIES_SILVER"), None);
+        assert_eq!(constants.get("SPECIES_HP"), None);
+        assert_eq!(
+            constants.resolve_value_to_name(1, uxie::ConstantFamily::Species),
+            Some("SPECIES_FARFETCHD".to_string())
+        );
     }
 
+    /// Check sound archive selection with an arbitrary encryption key.
     #[test]
     fn test_load_dspre_text_archives_emits_sound_constants_without_database_sounds() {
         let temp_dir = unique_temp_dir("dspre_sound_archives");
@@ -2132,7 +2099,7 @@ mod tests {
         fs::write(
             archives_dir.join("0545.json"),
             serde_json::to_string_pretty(&serde_json::json!({
-                "key": 12973,
+                "key": 0,
                 "messages": messages,
             }))
             .unwrap(),
@@ -2141,7 +2108,7 @@ mod tests {
 
         let mut constants = ConstantDb::new();
         let loaded = constants
-            .load_dspre_text_archives(&temp_dir, GameLanguage::English)
+            .load_dspre_text_archives(&temp_dir, GameFamily::Platinum, GameLanguage::English)
             .expect("failed to load dspre sound archive");
 
         fs::remove_dir_all(&temp_dir).ok();
@@ -2156,6 +2123,7 @@ mod tests {
         assert_eq!(constants.get("SEQ_SE_CONFIRM"), Some(1500));
     }
 
+    /// Check constants from the local Platinum sound archive against its scripts.
     #[test]
     #[ignore = "requires local DSPRE fixture tree"]
     fn integration_dspre_platinum_sound_archive_covers_fixture_script_symbols() {
@@ -2169,7 +2137,7 @@ mod tests {
         let mut constants = ConstantDb::new();
         let language = RomHeader::open(root).map_or(GameLanguage::English, |h| h.detect_language());
         constants
-            .load_dspre_text_archives(root, language)
+            .load_dspre_text_archives(root, GameFamily::Platinum, language)
             .expect("failed to load platinum DSPRE text archives");
 
         let sound_regex = regex::Regex::new(r"\bSEQ_[A-Z0-9_]+\b").unwrap();
@@ -2192,6 +2160,7 @@ mod tests {
         }
     }
 
+    /// Check constants from the local HGSS sound archive against its scripts.
     #[test]
     #[ignore = "requires local DSPRE fixture tree"]
     fn integration_dspre_hgss_sound_archive_covers_fixture_script_symbols() {
@@ -2205,7 +2174,7 @@ mod tests {
         let mut constants = ConstantDb::new();
         let language = RomHeader::open(root).map_or(GameLanguage::English, |h| h.detect_language());
         constants
-            .load_dspre_text_archives(root, language)
+            .load_dspre_text_archives(root, GameFamily::HGSS, language)
             .expect("failed to load hgss DSPRE text archives");
 
         let sound_regex = regex::Regex::new(r"\bSEQ_[A-Z0-9_]+\b").unwrap();
@@ -2228,17 +2197,20 @@ mod tests {
         }
     }
 
+    /// Check constants from local trainer archives against the reference banks.
     #[test]
     #[ignore = "requires local DSPRE fixture tree"]
     fn integration_dspre_trainer_archives_match_shipped_trainer_banks() {
-        for (root, expected_bank) in [
+        for (root, expected_bank, family) in [
             (
                 std::path::Path::new("tests/fixtures/pt_DSPRE_contents"),
                 std::path::Path::new("src/db/trainers.json"),
+                GameFamily::Platinum,
             ),
             (
                 std::path::Path::new("tests/fixtures/hg_DSPRE_contents"),
                 std::path::Path::new("src/db/hgss/trainers.json"),
+                GameFamily::HGSS,
             ),
         ] {
             assert!(
@@ -2256,7 +2228,7 @@ mod tests {
             let language =
                 RomHeader::open(root).map_or(GameLanguage::English, |h| h.detect_language());
             constants
-                .load_dspre_text_archives(root, language)
+                .load_dspre_text_archives(root, family, language)
                 .expect("failed to load DSPRE trainer archive");
 
             let expected: std::collections::HashMap<String, String> =
