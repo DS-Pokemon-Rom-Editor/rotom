@@ -136,6 +136,7 @@ impl<'a> Disassembler<'a> {
         Ok((items, self.jump_table_end_marker_count))
     }
 
+    /// Discover targets in unclassified gaps and update the symbol tables.
     fn discover_gap_targets(&mut self) {
         let code_start = self.code_start();
 
@@ -168,7 +169,9 @@ impl<'a> Disassembler<'a> {
                 } else {
                     gap_start + 1
                 };
-                if self.has_movement_sequence_at(aligned_gap_start, gap_end) {
+                if self.action_offsets.contains(&gap_start)
+                    || self.has_movement_sequence_at(aligned_gap_start, gap_end)
+                {
                     continue;
                 }
 
@@ -874,6 +877,9 @@ impl<'a> Disassembler<'a> {
             .map(|(f, _)| f)
     }
 
+    /// Decode a movement list in `start..end` without reading beyond the list.
+    ///
+    /// Return its IR and first unread offset, allowing a final terminator halfword.
     fn disassemble_action_with_span(&self, start: usize, end: usize) -> (Option<IrAction>, usize) {
         let mut instructions: Vec<IrOpcode> = Vec::new();
         let mut pc = start;
@@ -883,9 +889,17 @@ impl<'a> Disassembler<'a> {
             .get(&start)
             .map_or_else(|| format!("action_{:04X}", start), |info| info.name.clone());
 
-        while pc + 4 <= end && pc + 4 <= self.bytes.len() {
+        let end = end.min(self.bytes.len());
+        while pc + 2 <= end {
             let opcode = u16::from_le_bytes([self.bytes[pc], self.bytes[pc + 1]]);
-            let param = u16::from_le_bytes([self.bytes[pc + 2], self.bytes[pc + 3]]);
+            let param = if opcode == END_MOVEMENT_OPCODE {
+                0
+            } else {
+                if pc + 4 > end {
+                    break;
+                }
+                u16::from_le_bytes([self.bytes[pc + 2], self.bytes[pc + 3]])
+            };
 
             if let Some((mov_name, _)) = self.db.get_movement_by_id(opcode) {
                 let args = if opcode == END_MOVEMENT_OPCODE {
@@ -899,7 +913,11 @@ impl<'a> Disassembler<'a> {
                     args,
                 });
 
-                pc += 4;
+                pc += if opcode == END_MOVEMENT_OPCODE {
+                    (end - pc).min(4)
+                } else {
+                    4
+                };
 
                 if opcode == END_MOVEMENT_OPCODE {
                     break;
@@ -1311,6 +1329,51 @@ mod opcode_collision_tests {
             panic!("expected normal script output");
         };
         assert_no_goto_and_has_action(&items);
+    }
+
+    /// Check adjacent referenced lists with two-byte terminators and a count of 254.
+    #[test]
+    fn halfword_movement_terminators_do_not_consume_the_next_action() {
+        let bin = [
+            &[2, 0, 0, 0, 0x13, 0xFD][..],   // Script at 6
+            &[0x5E, 0, 255, 0, 10, 0, 0, 0], // ApplyMovement -> 24
+            &[0x5E, 0, 255, 0, 8, 0, 0, 0],  // ApplyMovement -> 30
+            &[2, 0],                         // End
+            &[0x20, 0, 1, 0, 0xFE, 0],       // WalkOnSpotNormalNorth + EndMovement
+            &[0, 0, 0xFE, 0, 0xFE, 0],       // FaceNorth(254) + EndMovement
+        ]
+        .concat();
+        let db = DatabaseV2::test_platinum();
+        let output = disassemble_bytes(db, bin).expect("disassemble");
+        let ScriptOutput::Normal { items, .. } = &output else {
+            panic!("expected normal script output");
+        };
+        assert_no_goto_and_has_action(items);
+        for item in items {
+            if let TopLevelItem::Action(action) = item {
+                assert!(
+                    matches!(action.instructions.last(), Some(IrOpcode::Command { name, .. }) if name == "EndMovement"),
+                    "movement terminator was lost: {action:#?}"
+                );
+            }
+        }
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TopLevelItem::Action(_)))
+                .count(),
+            2
+        );
+        let source =
+            crate::decompiler::ir_to_source(&output, crate::DecompileContext::standalone(db, None));
+        assert!(!source.contains("BufferContestantMonName"), "{source}");
+        crate::compile(
+            &source,
+            db,
+            &crate::ConstantDb::new(),
+            crate::BinaryQuirk::default(),
+        )
+        .unwrap_or_else(|error| panic!("{error}\n{source}"));
     }
 
     #[test]
