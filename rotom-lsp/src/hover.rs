@@ -291,8 +291,11 @@ fn append_global_script_info(
     );
 }
 
-/// If the cursor is inside a command with a `text_slot` parameter, append
-/// the message text from the game's text archive to the hover content.
+/// Appends archive message text to `content` when the cursor is on a text slot.
+///
+/// Finds the text from the source position, message index, and project data.
+/// Keeps control markers visible, with line breaks after `\n` and `\f`
+/// and a blank line after `\r`.
 #[allow(clippy::too_many_arguments)]
 fn append_message_text(
     content: &mut String,
@@ -317,13 +320,31 @@ fn append_message_text(
     ) else {
         return;
     };
-    content.push_str("\n\n> ");
-    content.push('\u{AB}');
-    for line in text.replace('\r', "\n").lines() {
-        content.push_str("\n> ");
-        content.push_str(line);
+    // An explicit text language prevents editors from highlighting dialogue as
+    // source code. The fence must be longer than any backtick run in the text.
+    let longest_run = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(3.max(longest_run + 1));
+    let _ = write!(content, "\n\n> {fence}text\n> «");
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            content.push_str("\n> ");
+            continue;
+        }
+        content.push(ch);
+        if ch == '\\' && chars.peek().is_some_and(|c| matches!(c, 'n' | 'r' | 'f')) {
+            let control = chars.next().unwrap();
+            content.push(control);
+            if chars.peek().is_some() {
+                if control == 'r' {
+                    content.push_str("\n>");
+                }
+                content.push_str("\n> ");
+            }
+        }
     }
-    content.push('\u{BB}');
+    let _ = write!(content, "»\n> {fence}");
 }
 
 /// Determine the archive ID and fetch the message text for the hovered
@@ -763,6 +784,79 @@ mod tests {
             .expect("expected hover");
 
         assert!(hover_markdown(hover).contains("Word-wraps a message string"));
+    }
+
+    /// Checks message layout in hover responses using temporary archive files.
+    #[test]
+    fn compute_hover_formats_message_windows() {
+        let cases = [
+            ("Hello, trainer!", "Hello, trainer!"),
+            (
+                r"I had a battle the other day, and my\nPokémon’s HP got low.\rI thought we were done for.\rAnd then, all of a sudden, my Pokémon\nate the Berry it was holding! Whew!",
+                "I had a battle the other day, and my\\n\n> Pokémon’s HP got low.\\r\n>\n> I thought we were done for.\\r\n>\n> And then, all of a sudden, my Pokémon\\n\n> ate the Berry it was holding! Whew!",
+            ),
+            (
+                r"First line\nSecond line\fThird line\fFourth line\rNew window\nSecond line",
+                "First line\\n\n> Second line\\f\n> Third line\\f\n> Fourth line\\r\n>\n> New window\\n\n> Second line",
+            ),
+            (r"End\n", r"End\n"),
+            (r"End\r", r"End\r"),
+            (r"End\f", r"End\f"),
+            (r"\n\r\f", "\\n\n> \\r\n>\n> \\f"),
+            (
+                r"# *Pokémon* [VAR 0x0100(0)] `code` ``` ~~~ \q \",
+                r"# *Pokémon* [VAR 0x0100(0)] `code` ``` ~~~ \q \",
+            ),
+            (
+                "First\r\nSecond\rThird\nFourth",
+                "First\n> Second\n> Third\n> Fourth",
+            ),
+            ("Before\n```\nAfter", "Before\n> ```\n> After"),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let archives = temp.path().join("expanded/textArchives");
+        std::fs::create_dir_all(&archives).unwrap();
+        let messages: Vec<_> = cases
+            .iter()
+            .map(|(text, _)| serde_json::json!({ "en_US": text }))
+            .collect();
+        std::fs::write(
+            archives.join("0199.json"),
+            serde_json::to_vec(&serde_json::json!({ "messages": messages })).unwrap(),
+        )
+        .unwrap();
+        let project = test_project(
+            uxie::Workspace::new(temp.path().to_path_buf(), uxie::game::Game::Platinum),
+            ConstantDb::new(),
+        );
+
+        for (index, (_, expected)) in cases.iter().enumerate() {
+            let source = format!("script Test #1:\n    MessageFromBank 199, {index}\n");
+            let offset = source.rfind(&index.to_string()).unwrap();
+            let position = SourceMap::new(&source).byte_to_position(offset);
+            let hover = compute_hover(
+                &source,
+                LspPosition {
+                    line: position.line,
+                    character: position.character,
+                },
+                Some(&project),
+                None,
+            )
+            .expect("expected message hover");
+            let fence = if expected.contains("```") {
+                "````"
+            } else {
+                "```"
+            };
+            assert_eq!(
+                hover_markdown(hover),
+                format!(
+                    "**{index}**\n\nHex: `0x{index:x}`\n\n> {fence}text\n> «{expected}»\n> {fence}"
+                ),
+                "message case {index}",
+            );
+        }
     }
 
     #[test]

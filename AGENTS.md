@@ -83,11 +83,10 @@ The test: Every changed line should trace directly to the user's request.
 
 ## 9. Document What You Touch
 
-**If a function lacks a doc comment and you modify it, add one.**
+**If a function lacks a doc comment and you modify it, add one. If it is inaccurate, update it.**
 
-- Keep docs concise and in simple, easy to understand language.
+- Keep docs concise and in simple, easy to understand language. Use everyday words and short sentences.
 - Always document inputs and outputs of a function, and any side effects.
-- Write all Documentation in ASD-STE100 Simplified Technical English
 - Otherwise, adhere to Rust RFC 1574
 
 ---
