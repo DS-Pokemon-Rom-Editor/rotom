@@ -80,6 +80,9 @@ fn word_ending_at(text: &str) -> Option<String> {
     }
 }
 
+/// Returns signature help for a built-in name, or `None` if the name is unknown.
+///
+/// `active_param` selects the highlighted parameter.
 fn builtin_signature_help(name: &str, active_param: u32) -> Option<SignatureHelp> {
     match name {
         "Menu" | "MenuGlobal" => Some(menu_builder_signature(name, active_param)),
@@ -136,8 +139,9 @@ fn builtin_signature_help(name: &str, active_param: u32) -> Option<SignatureHelp
                 label: "format(string)".to_string(),
                 documentation: Some(tower_lsp::lsp_types::Documentation::String(
                     "Word-wraps a message string to fit the dialog box. \
-                     Each source newline defines a segment boundary; \
-                     segments wider than the dialog are word-wrapped within."
+                     Source line breaks add line feeds or scrolls; blank lines clear \
+                     the window. Explicit markers take precedence. Lines that are too \
+                     wide produce a warning and are wrapped automatically."
                         .to_string(),
                 )),
                 parameters: Some(vec![ParameterInformation {

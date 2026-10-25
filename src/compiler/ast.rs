@@ -185,6 +185,52 @@ pub struct Spanned<T> {
 pub type Expression = Spanned<ExpressionKind>;
 pub type Statement = Spanned<StatementKind>;
 
+/// Returns the text for `format()` from parsed string segments.
+///
+/// Source lines become line feeds or scrolls; blank lines clear the window.
+/// Explicit breaks take precedence. Empty opening and closing lines are ignored.
+/// The segments and their source positions are left unchanged.
+pub(crate) fn format_string_segments(segments: &[(String, usize)]) -> String {
+    let mut text = String::new();
+    let mut bottom_row = false;
+    let mut blank_line = false;
+
+    for (line, _) in segments {
+        let line = line.trim_end_matches([' ', '\t', '\r']);
+        if line.is_empty() {
+            blank_line = true;
+            continue;
+        }
+
+        let explicit_break = [r"\n", r"\r", r"\f"]
+            .iter()
+            .any(|marker| text.ends_with(marker) || line.starts_with(marker));
+        if !text.is_empty() && !explicit_break {
+            if blank_line {
+                text.push_str(r"\r");
+                bottom_row = false;
+            } else if bottom_row {
+                text.push_str(r"\f");
+            } else {
+                text.push_str(r"\n");
+                bottom_row = true;
+            }
+        }
+        blank_line = false;
+        text.push_str(line);
+
+        for pair in line.as_bytes().windows(2) {
+            match pair {
+                b"\\n" => bottom_row = !bottom_row,
+                b"\\r" => bottom_row = false,
+                _ => {}
+            }
+        }
+    }
+
+    text
+}
+
 impl Spanned<ExpressionKind> {
     /// Returns this expression as text for constant evaluation, or an error.
     ///
@@ -305,6 +351,36 @@ impl Spanned<ExpressionKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks layout conversion at source breaks and explicit markers.
+    #[test]
+    fn format_string_segments_preserves_layout() {
+        for (source, expected) in [
+            ("", ""),
+            ("\n \t\n", ""),
+            ("hello", "hello"),
+            ("a\nb\nc\nd", r"a\nb\fc\fd"),
+            ("\n\na\nb\n\nc\n\n\n", r"a\nb\rc"),
+            ("a\n \t\n\nb\nc", r"a\rb\nc"),
+            ("a\\n\nb\nc", r"a\nb\fc"),
+            ("a\\r\nb\nc", r"a\rb\nc"),
+            ("a\\n\nb\\f\nc\nd", r"a\nb\fc\fd"),
+            ("a\n\\rb\nc", r"a\rb\nc"),
+            ("a\\rwithin\nb\nc", r"a\rwithin\nb\fc"),
+            ("a\\n\n\nb", r"a\nb"),
+            ("a\\r  \nb", r"a\rb"),
+            ("a\\fb\nc", r"a\fb\nc"),
+            ("a\\nb\\nc\nd", r"a\nb\nc\nd"),
+            ("\r\na\r\nb\r\n\r\nc\r\n", r"a\nb\rc"),
+            ("Pokémon\nété\nfin", r"Pokémon\nété\ffin"),
+        ] {
+            let segments: Vec<_> = source
+                .split('\n')
+                .map(|line| (line.to_string(), 0))
+                .collect();
+            assert_eq!(format_string_segments(&segments), expected, "{source:?}");
+        }
+    }
 
     #[test]
     fn test_infix_constant_eval_parenthesizes_macro_arg_does_not() {

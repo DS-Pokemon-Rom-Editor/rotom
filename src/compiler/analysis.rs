@@ -8,6 +8,7 @@ use crate::database::{
 use super::{
     ast::{
         Expression, ExpressionKind, MenuConfig, MenuEntry, ScriptFile, Statement, StatementKind,
+        format_string_segments,
     },
     diagnostic::{CompileError, CompileWarning, ParseResult, analysis_error},
 };
@@ -1175,14 +1176,17 @@ impl<'a> Analyzer<'a> {
                 let ExpressionKind::String(segs) = &args[0].node else {
                     unreachable!()
                 };
-                // format() handles all word-wrapping itself, so line-width
-                // warnings are never meaningful here regardless of segment count.
-                let flat = segs
-                    .iter()
-                    .map(|(s, _)| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let encoding_errors = uxie::validate_message(&flat);
+                for (i, (seg, seg_start)) in segs.iter().enumerate() {
+                    let line = seg.trim_end_matches([' ', '\t', '\r']);
+                    if uxie::format_line_is_too_long(line).unwrap_or(false) {
+                        self.warnings.push(CompileWarning::MessageLineTooLong {
+                            span: *seg_start..*seg_start + line.len(),
+                            line_index: i + 1,
+                        });
+                    }
+                }
+                let text = format_string_segments(segs);
+                let encoding_errors = uxie::validate_message(&text);
                 if !encoding_errors.is_empty() {
                     return Err(analysis_error(
                         args[0].span.clone(),
@@ -1451,6 +1455,43 @@ mod tests {
     use crate::compiler::ast::{ExpressionKind, FunctionHeader, StatementKind};
     use crate::database::{CommandType, DatabaseMeta, Variant};
     use std::collections::HashMap;
+
+    /// Checks that wide source lines are underlined in plain and formatted strings.
+    #[test]
+    fn message_line_warnings_keep_source_positions() {
+        let db = DatabaseV2::test_platinum();
+        let constants = ConstantDb::new();
+        let long_line = "hello ".repeat(20).trim_end().to_string();
+        for formatted in [false, true] {
+            let literal = format!("\"\n    Pokémon\n    {long_line}\n    End\n\"");
+            let argument = if formatted {
+                format!("format({literal})")
+            } else {
+                literal
+            };
+            let source = format!("script Test #1:\n    MessageFromBank 1, {argument}\n    End\n");
+            let ast = crate::compiler::Parser::new(crate::compiler::Lexer::new(&source))
+                .parse_script_file()
+                .unwrap();
+            let mut analyzer = Analyzer::with_database(&constants, db);
+            analyzer.analyze(&ast).unwrap();
+            let start = source.find(&long_line).unwrap();
+            assert!(
+                matches!(
+                    analyzer.warnings.as_slice(),
+                    [CompileWarning::MessageLineTooLong { span, line_index: 3 }]
+                        if *span == (start..start + long_line.len())
+                ),
+                "{:?}",
+                analyzer.warnings,
+            );
+            assert!(
+                analyzer.warnings[0]
+                    .message()
+                    .contains("format() inserts extra breaks as needed")
+            );
+        }
+    }
 
     fn view_rankings_shape_db() -> DatabaseV2 {
         let mut commands = HashMap::new();

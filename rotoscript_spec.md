@@ -527,7 +527,7 @@ Message "Hello, I'm on the first line,
          and I'm on the second line."
 ```
 
-The segments are joined with a space when written to the archive, so the example above stores `"Hello, I'm on the first line, and I'm on the second line."`. The game's dialog engine handles its own line-breaking when displaying the text.
+For ordinary strings, the segments are joined with a space when written to the archive, so the example above stores `"Hello, I'm on the first line, and I'm on the second line."`. Source newlines do not add in-game breaks.
 
 The compiler also tracks per-segment widths and emits a **`MessageLineTooLong`** warning when a segment exceeds the maximum dialog line width.
 
@@ -539,7 +539,24 @@ Wrapping a string in `format()` instructs the compiler to insert automatic word-
 Message format("A long line of dialogue that needs to fit neatly inside the dialog box.")
 ```
 
-`format()` suppresses the `MessageLineTooLong` warning because line-breaking is handled automatically.
+Inside `format()`, source line breaks also control the message layout:
+
+```rotom
+Message format("
+    First line
+    Second line
+    Third line
+
+    New window
+    Second line
+")
+```
+
+The first source break in a group becomes `\n`. Further breaks become `\f`, scrolling the same window. A blank source line becomes `\r`, clearing the window and starting a new group. The example stores `First line\nSecond line\fThird line\rNew window\nSecond line\r`; the last `\r` is added by the wrapper.
+
+Empty opening and closing lines are ignored. Multiple blank lines between groups produce one clear. Explicit `\n`, `\r`, and `\f` markers take precedence at source line boundaries, so no extra break is added there. A `\r` starts a fresh group even when it occurs within a source line.
+
+Source lines wider than the dialog produce a **`MessageLineTooLong`** warning at that line. The wrapper splits them and may add window clears. It also turns a `\n` into a clear if earlier wrapping has already filled both rows. Shorten the line or add your own breaks to control the layout.
 
 > [!NOTE]
 > String literals and `format()` require the compiler to have a project workspace configured so it knows which text archive to write to. In single-file compilation mode they produce a compile error.

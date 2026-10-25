@@ -315,7 +315,7 @@ MessageFromBank 1, "text here"
 
 The compiler takes care of storing the text in the right place automatically.
 
-Strings can span multiple lines. Leading whitespace at the start of each new line is stripped, so you can indent freely without it showing up in-game:
+Strings can span multiple lines. Leading whitespace at the start of each new line is stripped, so you can indent freely without it showing up in-game. Ordinary strings join those lines with spaces:
 
 ```rotom
 script LongSpeech #1:
@@ -335,7 +335,21 @@ script Explanation #1:
     End
 ```
 
-The formatter also respects manually inserted line breaks, so if you dont like a certain line break placement or want to end a line early, you can insert `\n` or `\r` to force a line break at that point.
+Inside `format()`, you can also lay out the message using source lines:
+
+```rotom
+Message format("
+    First line
+    Second line
+    Third line
+
+    New window
+")
+```
+
+The first break in each group becomes `\n`; later breaks scroll with `\f`. A blank line clears the window with `\r`. Empty opening and closing lines are ignored, and explicit `\n`, `\r`, or `\f` markers take precedence over source breaks.
+
+Lines that are too wide produce a warning and are wrapped automatically, which may add window clears. Shorten the line or add your own breaks if you want a different layout.
 
 > [!IMPORTANT]
 > String literals and `format()` only work when compiling as part of a project; single-file compilation doesn't have the context to know where to store the text.

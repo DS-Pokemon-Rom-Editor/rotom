@@ -512,7 +512,7 @@ fn format_command_hover(name: &str, cmd: &Command) -> String {
     lines.join("\n")
 }
 
-/// Return hover markdown for built-in rotom language constructs, or `None` if
+/// Returns hover markdown for built-in rotom language constructs, or `None` if
 /// the word is not a built-in.
 fn builtin_hover(word: &str) -> Option<String> {
     match word {
@@ -557,9 +557,11 @@ fn builtin_hover(word: &str) -> Option<String> {
              Word-wraps a message string to fit the dialog box, inserting line breaks \
              automatically based on glyph widths.\n\
              \n\
-             Each real newline in the source string defines a **segment boundary**. \
-             Segments longer than the dialog width are word-wrapped within. \
-             Explicit escape sequences (`\\n`, `\\r`, `\\f`) are always preserved as-is.\n\
+             Source line breaks become `\\n` on the first line of a window and \
+             `\\f` afterward. Blank lines clear the window with `\\r`. \
+             Empty opening and closing lines are ignored. Explicit markers take \
+             precedence over source breaks. Lines that are too wide produce a \
+             warning and are wrapped automatically, which may add window clears.\n\
              \n\
              ## Parameters\n\
              - `string` - the message text"

@@ -17,7 +17,7 @@ use crate::autovar::{VAR_RESULT, autovar_call_parts, autovar_param_index};
 use crate::compiler::analysis::{SymbolTable, SymbolType};
 use crate::compiler::ast::{
     Expression, ExpressionKind, MatchCase, MenuConfig, MenuEntry, ScriptFile, Statement,
-    StatementKind,
+    StatementKind, format_string_segments,
 };
 use crate::compiler::diagnostic::{ParseResult, lowering_error, lowering_error_at};
 use crate::compiler::token::TokenType;
@@ -1764,14 +1764,8 @@ impl<'a> Lowerer<'a> {
                         "format() requires a string literal argument",
                     ));
                 };
-                let wrapped = uxie::format_message(
-                    &segs
-                        .iter()
-                        .map(|(s, _)| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-                .map_err(|e| {
+                let text = format_string_segments(segs);
+                let wrapped = uxie::format_message(&text).map_err(|e| {
                     lowering_error_at(expr.span.clone(), format!("failed to format message: {e}"))
                 })?;
                 let workspace = self
@@ -5042,6 +5036,104 @@ TestLabel:
             "scripts_common.s should compile successfully. Error: {:?}",
             result.err()
         );
+    }
+
+    /// Checks stored message text after parsing, analysis, lowering, and flushing.
+    #[test]
+    fn formatted_message_layout_reaches_archive() {
+        let db = create_test_db();
+        let constants = ConstantDb::new();
+        let long_line = "hello ".repeat(20).trim_end().to_string();
+        let wide_source = format!("format(\"Top\nBottom\n{long_line}\")");
+        let wide_expected = uxie::format_message(&format!(r"Top\nBottom\f{long_line}")).unwrap();
+        let cases = [
+            ("format(\"Hello\")", r"Hello\r"),
+            ("format(\"\")", r"\r"),
+            ("format(\"\n \t\n\")", r"\r"),
+            (
+                "format(\"First\n    Second\n    Third\n    Fourth\n\n    New\n    Last\")",
+                r"First\nSecond\fThird\fFourth\rNew\nLast\r",
+            ),
+            (
+                "format(\"\n\n    First\n    Second\n \t\n\n    New\n\n\")",
+                r"First\nSecond\rNew\r",
+            ),
+            (
+                "format(\"First\\n\n    Second\\f\n    Third\\r\n    New\n    Last\")",
+                r"First\nSecond\fThird\rNew\nLast\r",
+            ),
+            (
+                "format(\"First\n    \\rNew\n    Last\")",
+                r"First\rNew\nLast\r",
+            ),
+            ("format(\"First\\n\n\n    Second\")", r"First\nSecond\r"),
+            ("format(\"First\\r\")", r"First\r"),
+            ("format(\"First\\nSecond\\f\")", r"First\nSecond\f"),
+            (
+                "format(\"\r\n    First\r\n    Second\r\n\r\n    New\r\n\")",
+                r"First\nSecond\rNew\r",
+            ),
+            ("\"First\n    Second\"", "First Second"),
+            ("\"First\\r\n    Second\"", r"First\r Second"),
+            ("\"First\n\n    Second\"", "First  Second"),
+            (&wide_source, &wide_expected),
+        ];
+        for (argument, expected) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let archives = temp.path().join("expanded/textArchives");
+            std::fs::create_dir_all(&archives).unwrap();
+            std::fs::write(archives.join("0001.json"), r#"{"key":0,"messages":[]}"#).unwrap();
+            let workspace = Arc::new(uxie::Workspace::new(
+                temp.path().to_path_buf(),
+                uxie::game::Game::Platinum,
+            ));
+            let project = project_for_workspace(workspace.clone());
+            let source = format!("script Test #1:\n    MessageFromBank 1, {argument}\n    End\n");
+            let ast = Parser::new(Lexer::new(&source))
+                .parse_script_file()
+                .unwrap();
+            let mut analyzer = Analyzer::with_database(&constants, db);
+            analyzer.analyze(&ast).unwrap();
+            let mut lowerer =
+                Lowerer::for_file(&analyzer.symbols, &project, &constants, "test".to_string());
+            lowerer.lower_script_file(&ast).unwrap();
+            workspace.flush_pending_messages().unwrap();
+
+            // A fresh workspace reads the archive on disk, not the session cache.
+            let reopened =
+                uxie::Workspace::new(temp.path().to_path_buf(), uxie::game::Game::Platinum);
+            assert_eq!(
+                reopened.read_message(1, 0).as_deref(),
+                Some(expected),
+                "{argument}",
+            );
+            if argument == wide_source {
+                let warning = analyzer
+                    .warnings
+                    .iter()
+                    .find(|warning| {
+                        matches!(
+                            warning,
+                            crate::compiler::CompileWarning::MessageLineTooLong { .. }
+                        )
+                    })
+                    .expect("wide source line should produce a warning");
+                assert_eq!(&source[warning.span()], long_line);
+                let after_scroll = expected.strip_prefix(r"Top\nBottom\f").unwrap();
+                let first_break = after_scroll.find('\\').unwrap();
+                assert!(after_scroll[first_break..].starts_with(r"\r"));
+                assert_eq!(
+                    after_scroll
+                        .replace(r"\n", " ")
+                        .replace(r"\r", " ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>(),
+                    long_line.split_whitespace().collect::<Vec<_>>(),
+                );
+            } else {
+                assert!(analyzer.warnings.is_empty(), "{argument}");
+            }
+        }
     }
 
     #[test]

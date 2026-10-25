@@ -73,6 +73,7 @@ impl CompileWarning {
         }
     }
 
+    /// Returns the warning text for CLI and editor diagnostics.
     pub fn message(&self) -> String {
         match self {
             Self::UnusedAlias { name, .. } => format!("Alias '{name}' is never used"),
@@ -85,7 +86,8 @@ impl CompileWarning {
             ),
             Self::MessageLineTooLong { line_index, .. } => format!(
                 "Message line {line_index} exceeds the maximum dialog width — \
-                 add explicit line breaks or wrap with format()"
+                 add explicit line breaks to control the layout; \
+                 format() inserts extra breaks as needed"
             ),
             Self::VariantConditionUnresolvable {
                 command, condition, ..
