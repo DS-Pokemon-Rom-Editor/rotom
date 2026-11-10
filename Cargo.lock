@@ -1901,8 +1901,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "uxie"
 version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afe336225b50350fb38d4de30925cab32c416126c653553c37df4dccd5f3fec"
+source = "git+https://github.com/DS-Pokemon-Rom-Editor/uxie?rev=b64bf72#b64bf7253a8ccb765776457ee5e2cdf7e6b150fe"
 dependencies = [
  "binrw",
  "bitcode",

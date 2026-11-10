@@ -62,3 +62,7 @@ use_self = "allow"
 uninlined_format_args = "allow"
 option_if_let_else = "allow"
 missing_const_for_fn = "allow"
+
+# uxie global script text banks, until a uxie release includes them.
+[patch.crates-io]
+uxie = { git = "https://github.com/DS-Pokemon-Rom-Editor/uxie", rev = "b64bf72" }
